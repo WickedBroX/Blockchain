@@ -1,8 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetSpanHints } from "../workers/adaptiveSpan";
 import type { ExecutionBatch } from "../services/executionStore";
-import type { RpcBlock, RpcClient, RpcLogEntry, RpcTransactionReceipt } from "../lib/rpcClient";
+import {
+  RpcEndpointError,
+  type RpcBlock,
+  type RpcClient,
+  type RpcLogEntry,
+  type RpcTransactionReceipt,
+} from "../lib/rpcClient";
+import type { ChainConfigRecord, ChainEndpointRecord } from "../services/chainConfigService";
 import { ChainPoller } from "../workers/chainPoller";
+
+vi.mock("../services/chainConfigService", async () => {
+  const actual = await vi.importActual<typeof import("../services/chainConfigService")>(
+    "../services/chainConfigService",
+  );
+
+  return {
+    ...actual,
+    updateChainEndpoint: vi.fn(async () => {}),
+  };
+});
 
 process.env.CHAIN_POLLER_SKIP_AUTOSTART = "true";
 
@@ -208,6 +226,151 @@ describe("ChainPoller", () => {
     expect(rpcClientMock.getTransactionReceipt).not.toHaveBeenCalled();
     expect(rpcClientMock.getBlockReceipts).toHaveBeenCalledWith(blockHash);
     expect(storeExecutionBatchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs invalid hex only once per endpoint", async () => {
+    const poller = new ChainPoller(
+      {
+        chainId: 1,
+        mode: "live",
+        startBlock: 1n,
+        confirmations: 1,
+        pollIntervalMs: 1_000,
+        targetBlock: null,
+        useCheckpoint: false,
+      },
+      {
+        rpcClient: rpcClientMock as unknown as RpcClient,
+        storeBatch: storeExecutionBatchMock,
+        getCheckpoint: getCheckpointMock,
+      },
+    );
+
+    const endpoint: ChainEndpointRecord = {
+      id: "endpoint-1",
+      chainId: 1,
+      url: "https://primary.example",
+      label: "Primary",
+      isPrimary: true,
+      enabled: true,
+      qps: 0,
+      minSpan: 1,
+      maxSpan: 2,
+      weight: 100,
+      orderIndex: 0,
+      lastHealth: null,
+      lastCheckedAt: null,
+      updatedAt: new Date(),
+    };
+
+    const runtimeConfig: ChainConfigRecord = {
+      chainId: 1,
+      name: "Chain 1",
+      enabled: true,
+      rpcUrl: endpoint.url,
+      rpcSource: "database",
+      etherscanApiKey: null,
+      etherscanSource: "none",
+      startBlock: 0n,
+      qps: 0,
+      minSpan: 1,
+      maxSpan: 2,
+      updatedAt: new Date(),
+      endpoints: [endpoint],
+    };
+
+    (poller as unknown as { runtimeConfig: ChainConfigRecord | null }).runtimeConfig = runtimeConfig;
+    (poller as unknown as { activeEndpoint: ChainEndpointRecord | null }).activeEndpoint = endpoint;
+    (poller as unknown as { lastAppliedSettings: unknown }).lastAppliedSettings = {
+      rpcUrl: endpoint.url,
+      qps: 0,
+      minSpan: runtimeConfig.minSpan,
+      maxSpan: runtimeConfig.maxSpan,
+      endpointId: endpoint.id,
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const error = new RpcEndpointError("invalid hex", "invalid_hex", "eth_blockNumber", {
+      value: null,
+    });
+
+    await (poller as unknown as { handleEndpointFailure: (err: RpcEndpointError) => Promise<void> }).handleEndpointFailure(
+      error,
+    );
+    await (poller as unknown as { handleEndpointFailure: (err: RpcEndpointError) => Promise<void> }).handleEndpointFailure(
+      error,
+    );
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    warnSpy.mockRestore();
+  });
+
+  it("clears invalid hex warnings once endpoint cooldown expires", () => {
+    const poller = new ChainPoller(
+      {
+        chainId: 1,
+        mode: "live",
+        startBlock: 1n,
+        confirmations: 1,
+        pollIntervalMs: 1_000,
+        targetBlock: null,
+        useCheckpoint: false,
+      },
+      {
+        rpcClient: rpcClientMock as unknown as RpcClient,
+        storeBatch: storeExecutionBatchMock,
+        getCheckpoint: getCheckpointMock,
+      },
+    );
+
+    const endpoint: ChainEndpointRecord = {
+      id: "endpoint-1",
+      chainId: 1,
+      url: "https://primary.example",
+      label: "Primary",
+      isPrimary: true,
+      enabled: true,
+      qps: 0,
+      minSpan: 1,
+      maxSpan: 2,
+      weight: 100,
+      orderIndex: 0,
+      lastHealth: null,
+      lastCheckedAt: null,
+      updatedAt: new Date(),
+    };
+
+    const runtimeConfig: ChainConfigRecord = {
+      chainId: 1,
+      name: "Chain 1",
+      enabled: true,
+      rpcUrl: endpoint.url,
+      rpcSource: "database",
+      etherscanApiKey: null,
+      etherscanSource: "none",
+      startBlock: 0n,
+      qps: 0,
+      minSpan: 1,
+      maxSpan: 2,
+      updatedAt: new Date(),
+      endpoints: [endpoint],
+    };
+
+    const internals = poller as unknown as {
+      failedEndpoints: Map<string, number>;
+      invalidEndpointWarnings: Set<string>;
+      pruneFailedEndpoints: (config: ChainConfigRecord) => void;
+    };
+
+    internals.failedEndpoints.set(endpoint.id, Date.now() - 600_000);
+    internals.invalidEndpointWarnings.add(`id:${endpoint.id}`);
+
+    internals.pruneFailedEndpoints(runtimeConfig);
+
+    expect(internals.failedEndpoints.size).toBe(0);
+    expect(internals.invalidEndpointWarnings.has(`id:${endpoint.id}`)).toBe(false);
   });
 });
 

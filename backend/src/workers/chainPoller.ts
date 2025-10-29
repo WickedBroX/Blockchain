@@ -96,6 +96,7 @@ export class ChainPoller {
   private readinessState: "ready" | "disabled" | "missingRpc" | null = null;
   private activeEndpoint: ChainEndpointRecord | null = null;
   private readonly failedEndpoints = new Map<string, number>();
+  private readonly invalidEndpointWarnings = new Set<string>();
 
   constructor(
     private readonly config: ChainPollerConfig,
@@ -160,6 +161,7 @@ export class ChainPoller {
     for (const [endpointId, failedAt] of this.failedEndpoints) {
       if (failedAt + ENDPOINT_FAILURE_COOLDOWN_MS <= now) {
         this.failedEndpoints.delete(endpointId);
+        this.invalidEndpointWarnings.delete(`id:${endpointId}`);
         continue;
       }
 
@@ -167,11 +169,13 @@ export class ChainPoller {
 
       if (!match) {
         this.failedEndpoints.delete(endpointId);
+        this.invalidEndpointWarnings.delete(`id:${endpointId}`);
         continue;
       }
 
       if (match.updatedAt.getTime() > failedAt) {
         this.failedEndpoints.delete(endpointId);
+        this.invalidEndpointWarnings.delete(`id:${endpointId}`);
       }
     }
   }
@@ -264,16 +268,33 @@ export class ChainPoller {
       getRpcUrl(this.config.chainId);
 
     const endpointHost = endpointUrl ? this.getEndpointHost(endpointUrl) : "unknown";
-
-    logEndpointFailure({
-      chainId: this.config.chainId,
-      endpointHost,
-      method: error.method,
-      error: error.kind,
-      details: error.details,
-    });
-
     const endpointId = this.activeEndpoint?.id ?? this.lastAppliedSettings?.endpointId ?? null;
+    let warningKey: string | null = null;
+
+    if (endpointId) {
+      warningKey = `id:${endpointId}`;
+    } else if (endpointUrl) {
+      warningKey = `url:${endpointUrl}`;
+    } else if (endpointHost) {
+      warningKey = `host:${endpointHost}`;
+    }
+
+    const shouldLogWarning =
+      error.kind !== "invalid_hex" || !warningKey || !this.invalidEndpointWarnings.has(warningKey);
+
+    if (shouldLogWarning) {
+      logEndpointFailure({
+        chainId: this.config.chainId,
+        endpointHost,
+        method: error.method,
+        error: error.kind,
+        details: error.details,
+      });
+
+      if (error.kind === "invalid_hex" && warningKey) {
+        this.invalidEndpointWarnings.add(warningKey);
+      }
+    }
 
     if (endpointId) {
       this.failedEndpoints.set(endpointId, Date.now());
@@ -993,7 +1014,7 @@ function logEndpointFailure(details: {
     payload.httpStatus = details.details.status;
   }
 
-  if (details.details.value !== undefined && details.details.value !== null) {
+  if (details.details.value !== undefined) {
     payload.value = details.details.value;
   }
 
