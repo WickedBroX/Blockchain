@@ -19,9 +19,11 @@ export function Header() {
   }, [navigate]);
 
   const handleLogout = useCallback(() => {
-    const key = ["admin-settings", token ?? ""] as const;
+    if (token) {
+      const key = ["admin-settings", token] as const;
+      void mutate(key, undefined, { revalidate: false });
+    }
     clearToken();
-    void mutate(key, undefined, { revalidate: false });
     navigate("/login", { replace: true });
   }, [clearToken, mutate, navigate, token]);
 

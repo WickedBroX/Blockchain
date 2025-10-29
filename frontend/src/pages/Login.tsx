@@ -47,7 +47,10 @@ export function LoginPage() {
     try {
       const response = await login({ email, password });
       setToken(response.token ?? null);
-      await mutate(["admin-settings", response.token ?? ""], undefined, { revalidate: true });
+
+      if (response.token) {
+        await mutate(["admin-settings", response.token], undefined, { revalidate: true });
+      }
       toast.success("Welcome back, admin");
       navigate(redirectPath, { replace: true });
     } catch (error) {
