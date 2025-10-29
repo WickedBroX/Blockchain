@@ -139,28 +139,13 @@ describe("security middleware", () => {
     expect(payload.role).toBe(dbUser.role);
   });
 
-  it("accepts username field for database login", async () => {
-    const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    const dbUser: DbUserRecord = {
-      id: "22222222-2222-2222-2222-222222222222",
-      email: ADMIN_EMAIL,
-      passwordHash,
-      role: null,
-      disabledAt: null,
-    };
-
-    dbFindUserSpy.mockResolvedValueOnce(dbUser);
-
+  it("rejects login payloads without an email", async () => {
     const response = await loginFromIp("10.0.0.15")
       .send({ username: "primary-admin", password: ADMIN_PASSWORD });
 
-    expect(response.status).toBe(200);
-    expect(response.body.user).toMatchObject({
-      id: dbUser.id,
-      email: dbUser.email,
-      source: "database",
-    });
-    expect(dbFindUserSpy).toHaveBeenCalledWith(expect.anything(), "primary-admin");
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({ error: "invalid_credentials" });
+    expect(dbFindUserSpy).not.toHaveBeenCalled();
   });
 
   it("returns configured chain list", async () => {
