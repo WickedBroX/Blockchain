@@ -12,7 +12,6 @@ import {
 
 interface LoginRequestBody {
   email?: string;
-  username?: string;
   password?: string;
 }
 
@@ -23,26 +22,25 @@ export function createAuthRouter(loginLimiter: RateLimitRequestHandler) {
 
   router.post("/login", loginLimiter, async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as LoginRequestBody;
-    const identifier =
+    const emailInput =
       typeof body.email === "string" && body.email.trim().length > 0
         ? body.email.trim()
-        : typeof body.username === "string" && body.username.trim().length > 0
-          ? body.username.trim()
-          : "";
+        : "";
     const password = typeof body.password === "string" ? body.password : "";
 
-    if (!identifier || !password) {
+    if (!emailInput || !password) {
       res.status(401).json({ error: "invalid_credentials" });
       return;
     }
 
-  const env = loadWebEnv();
-    const pool = env.databaseUrl ? getDefaultPool() : null;
-    const normalizedIdentifier = identifier.toLowerCase();
+    const normalizedEmail = emailInput.toLowerCase();
 
-    if (pool) {
-      try {
-        const dbUser = await dbFindUserByEmail(pool, identifier);
+    try {
+      const env = loadWebEnv();
+      const pool = env.databaseUrl ? getDefaultPool() : null;
+
+      if (pool) {
+        const dbUser = await dbFindUserByEmail(pool, emailInput);
 
         if (dbUser && dbUser.passwordHash) {
           const passwordMatches = await checkDbPassword(password, dbUser.passwordHash);
@@ -70,53 +68,54 @@ export function createAuthRouter(loginLimiter: RateLimitRequestHandler) {
             return;
           }
         }
-      } catch (error) {
-        console.warn("login lookup failed for database user");
       }
+
+      const envAdmin = getEnvAdmin();
+
+      if (!envAdmin) {
+        res.status(401).json({ error: "invalid_credentials" });
+        return;
+      }
+
+      const identifierMatches = safeEq(normalizedEmail, envAdmin.email.toLowerCase());
+      let passwordMatches = false;
+
+      if (envAdmin.password) {
+        passwordMatches = safeEq(password, envAdmin.password) || passwordMatches;
+      }
+
+      if (!passwordMatches && envAdmin.passwordHash) {
+        passwordMatches = await checkDbPassword(password, envAdmin.passwordHash);
+      }
+
+      if (!identifierMatches || !passwordMatches) {
+        res.status(401).json({ error: "invalid_credentials" });
+        return;
+      }
+
+      const token = jwt.sign(
+        {
+          sub: "admin",
+          email: envAdmin.email,
+          role: "admin",
+        },
+        env.jwtSecret,
+        { expiresIn: TOKEN_EXPIRATION },
+      );
+
+      res.json({
+        token,
+        user: {
+          id: "env-admin",
+          email: envAdmin.email,
+          role: "admin",
+          source: "env" as const,
+        },
+      });
+    } catch (error) {
+      console.error("failed to authenticate user", error);
+      res.status(500).json({ error: "auth_failed" });
     }
-
-    const envAdmin = getEnvAdmin();
-
-    if (!envAdmin) {
-      res.status(401).json({ error: "invalid_credentials" });
-      return;
-    }
-
-    const identifierMatches = safeEq(normalizedIdentifier, envAdmin.email.toLowerCase());
-    let passwordMatches = false;
-
-    if (envAdmin.password) {
-      passwordMatches = safeEq(password, envAdmin.password) || passwordMatches;
-    }
-
-    if (!passwordMatches && envAdmin.passwordHash) {
-      passwordMatches = await checkDbPassword(password, envAdmin.passwordHash);
-    }
-
-    if (!identifierMatches || !passwordMatches) {
-      res.status(401).json({ error: "invalid_credentials" });
-      return;
-    }
-
-    const token = jwt.sign(
-      {
-        sub: "admin",
-        email: envAdmin.email,
-        role: "admin",
-      },
-      env.jwtSecret,
-      { expiresIn: TOKEN_EXPIRATION },
-    );
-
-    res.json({
-      token,
-      user: {
-        id: "env-admin",
-        email: envAdmin.email,
-        role: "admin",
-        source: "env" as const,
-      },
-    });
   });
 
   return router;
