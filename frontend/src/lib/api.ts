@@ -2,8 +2,8 @@ import type {
   AdminConnectionChain,
   AdminConnectionEndpoint,
   AdminConnectionsResponse,
-  AdminRpcTestResult,
   AdminRpcTestFailure,
+  AdminRpcTestResult,
   AdminRpcTestSuccess,
   AdminSettings,
   AddressActivityResponse,
@@ -31,7 +31,7 @@ export class ApiError extends Error {
 
 type ChainResponse = { chains: Chain[] } | Chain[];
 
-type RequestOptions = RequestInit & { token?: string };
+type RequestOptions = RequestInit & { token?: string | null };
 
 function buildUrl(pathname: string): string {
   const trimmedBase = API_BASE_URL.replace(/\/$/, "");
@@ -162,21 +162,11 @@ export async function login(credentials: {
   });
 }
 
-export async function fetchAdminSettings(token?: string | null): Promise<AdminSettings> {
-  try {
-    return await fetchJson<AdminSettings>("/admin/settings", {
-      method: "GET",
-    });
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 401 && token) {
-      return fetchJson<AdminSettings>("/admin/settings", {
-        method: "GET",
-        token,
-      });
-    }
-
-    throw error;
-  }
+export async function fetchAdminSettings(token: string): Promise<AdminSettings> {
+  return fetchJson<AdminSettings>("/admin/settings", {
+    method: "GET",
+    token,
+  });
 }
 
 type RawAdminConnectionEndpoint = {
@@ -230,29 +220,19 @@ export interface AdminRpcTestPayload {
   endpointId?: string | null;
 }
 
-export async function fetchAdminConnections(
-  token?: string | null,
-): Promise<AdminConnectionsResponse> {
-  const request = (tokenOverride?: string | null) =>
-    fetchJson<RawAdminConnectionsResponse>("/admin/connections", {
-      method: "GET",
-      ...(tokenOverride ? { token: tokenOverride } : {}),
-    }).then(normalizeAdminConnections);
+export async function fetchAdminConnections(token: string): Promise<AdminConnectionsResponse> {
+  const payload = await fetchJson<RawAdminConnectionsResponse>("/admin/connections", {
+    method: "GET",
+    token,
+  });
 
-  try {
-    return await request();
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 401 && token) {
-      return request(token);
-    }
-    throw error;
-  }
+  return normalizeAdminConnections(payload);
 }
 
 export async function createAdminEndpoint(
   chainId: number,
   payload: AdminEndpointCreatePayload,
-  token?: string | null,
+  token: string,
 ): Promise<AdminConnectionEndpoint> {
   const body = buildEndpointRequestBody(payload);
   const response = await fetchJson<{ endpoint: RawAdminConnectionEndpoint }>(
@@ -260,7 +240,7 @@ export async function createAdminEndpoint(
     {
       method: "POST",
       body: JSON.stringify(body),
-      ...(token ? { token } : {}),
+      token,
     },
   );
 
@@ -271,7 +251,7 @@ export async function updateAdminEndpoint(
   chainId: number,
   endpointId: string,
   payload: AdminEndpointUpdatePayload,
-  token?: string | null,
+  token: string,
 ): Promise<AdminConnectionEndpoint> {
   const body = buildEndpointRequestBody(payload);
   const response = await fetchJson<{ endpoint: RawAdminConnectionEndpoint }>(
@@ -279,7 +259,7 @@ export async function updateAdminEndpoint(
     {
       method: "PUT",
       body: JSON.stringify(body),
-      ...(token ? { token } : {}),
+      token,
     },
   );
 
@@ -289,22 +269,22 @@ export async function updateAdminEndpoint(
 export async function disableAdminEndpoint(
   chainId: number,
   endpointId: string,
-  token?: string | null,
+  token: string,
 ): Promise<void> {
   await fetchJson<void>(`/admin/chains/${chainId}/endpoints/${endpointId}`, {
     method: "DELETE",
-    ...(token ? { token } : {}),
+    token,
   });
 }
 
 export async function testAdminRpc(
   payload: AdminRpcTestPayload,
-  token?: string | null,
+  token: string,
 ): Promise<AdminRpcTestResult> {
   const response = await fetchJson<RawAdminRpcTestResult>("/admin/test-rpc", {
     method: "POST",
     body: JSON.stringify(buildRpcTestRequestBody(payload)),
-    ...(token ? { token } : {}),
+    token,
   });
 
   return normalizeAdminRpcTestResult(response);
