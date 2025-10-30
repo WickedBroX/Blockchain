@@ -41,36 +41,42 @@ jobs:
       # ---------------------------
       - name: Backend deploy
         env:
-          REPO: ${{ github.repository }}  # e.g. WickedBroX/Blockchain
+          REPO: ${{ github.repository }}          # expands on the runner (e.g. WickedBroX/Blockchain)
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
+          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }} # <-- uncomment only if you choose Option 2
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<EOF
           set -eo pipefail
           cd ~/ExplorerToken
 
-          # Point origin to repo over SSH and sync
+          # repo URL injection is expanded on the runner
           git remote set-url origin git@github.com:${REPO}.git || true
           git fetch --prune
+
           DEF=\$(git remote show origin | sed -n 's/.*HEAD branch: //p'); [ -z "\$DEF" ] && DEF=main
           git checkout -B "\$DEF"
           git reset --hard "origin/\$DEF"
 
-          # ---- NVM/NPM bootstrap (non-interactive shell) ----
+          # --- Node/NPM for non-interactive shell (NVM) ---
           export NVM_DIR="\$HOME/.nvm"
-          if [ -s "\$NVM_DIR/nvm.sh" ]; then . "\$NVM_DIR/nvm.sh"; fi
-          if command -v nvm >/dev/null 2>&1; then
-            nvm use --lts || nvm use 22 || true
-          fi
-          # Append a known Node path (adjust if your version differs)
+          [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+          command -v nvm >/dev/null 2>&1 && { nvm use --lts || nvm use 22 || true; }
           export PATH="\$HOME/.nvm/versions/node/v22.21.0/bin:\$PATH"
           node -v && npm -v
 
           cd backend
           npm ci
           npm run build
+
+          # ---- SUDO OPTION 1: passwordless sudo (recommended) ----
           sudo systemctl restart explorertoken-backend
+
+          # ---- SUDO OPTION 2: with password secret ----
+          # sudo_pw() { echo "\$SUDO_PW" | sudo -S "\$@"; }
+          # sudo_pw systemctl restart explorertoken-backend
+
           curl -sS http://127.0.0.1:4000/health || true
           EOF
 
@@ -82,16 +88,14 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
+          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }} # <-- uncomment only if you choose Option 2
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'EOF'
           set -eo pipefail
 
-          # NVM/NPM bootstrap again for this SSH session
           export NVM_DIR="$HOME/.nvm"
-          if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh"; fi
-          if command -v nvm >/dev/null 2>&1; then
-            nvm use --lts || nvm use 22 || true
-          fi
+          [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+          command -v nvm >/dev/null 2>&1 && { nvm use --lts || nvm use 22 || true; }
           export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
           node -v && npm -v
 
@@ -107,8 +111,16 @@ jobs:
           )
           [ -n "$WEB_ROOT" ] || WEB_ROOT="/var/www/haswork.dev"
 
+          # ---- SUDO OPTION 1: passwordless sudo ----
           sudo rsync -av --delete dist/ "$WEB_ROOT"/
-          sudo nginx -t && sudo systemctl reload nginx
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+          # ---- SUDO OPTION 2: with password secret ----
+          # sudo_pw() { echo "$SUDO_PW" | sudo -S "$@"; }
+          # sudo_pw rsync -av --delete dist/ "$WEB_ROOT"/
+          # sudo_pw nginx -t
+          # sudo_pw systemctl reload nginx
           EOF
 
       - name: Collect backend logs (artifact)
@@ -118,8 +130,9 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "sudo journalctl -u explorertoken-backend -n 400 --no-pager" > backend_logs.txt
+            "sudo journalctl -u explorertoken-backend -n 300 --no-pager" > backend_logs.txt || true
           tar -czf logs.tgz backend_logs.txt
+          echo "If empty, service is healthy."
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
