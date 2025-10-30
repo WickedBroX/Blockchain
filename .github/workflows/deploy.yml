@@ -36,9 +36,12 @@ jobs:
         run: |
           ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
 
+      # ---------------------------
+      # Backend build & restart
+      # ---------------------------
       - name: Backend deploy
         env:
-          REPO: ${{ github.repository }}          # e.g. WickedBroX/Blockchain
+          REPO: ${{ github.repository }}  # e.g. WickedBroX/Blockchain
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -47,16 +50,22 @@ jobs:
           set -eo pipefail
           cd ~/ExplorerToken
 
-          # Point origin to new repo over SSH (runner expanded \$REPO above)
+          # Point origin to repo over SSH and sync
           git remote set-url origin git@github.com:${REPO}.git || true
           git fetch --prune
-
-          # Robust default-branch detection
-          DEF=\$(git remote show origin | sed -n 's/.*HEAD branch: //p')
-          [ -z "\$DEF" ] && DEF=main
-
+          DEF=\$(git remote show origin | sed -n 's/.*HEAD branch: //p'); [ -z "\$DEF" ] && DEF=main
           git checkout -B "\$DEF"
           git reset --hard "origin/\$DEF"
+
+          # ---- NVM/NPM bootstrap (non-interactive shell) ----
+          export NVM_DIR="\$HOME/.nvm"
+          if [ -s "\$NVM_DIR/nvm.sh" ]; then . "\$NVM_DIR/nvm.sh"; fi
+          if command -v nvm >/dev/null 2>&1; then
+            nvm use --lts || nvm use 22 || true
+          fi
+          # Append a known Node path (adjust if your version differs)
+          export PATH="\$HOME/.nvm/versions/node/v22.21.0/bin:\$PATH"
+          node -v && npm -v
 
           cd backend
           npm ci
@@ -65,6 +74,9 @@ jobs:
           curl -sS http://127.0.0.1:4000/health || true
           EOF
 
+      # ---------------------------
+      # Frontend build & publish
+      # ---------------------------
       - name: Frontend deploy
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
@@ -73,6 +85,16 @@ jobs:
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'EOF'
           set -eo pipefail
+
+          # NVM/NPM bootstrap again for this SSH session
+          export NVM_DIR="$HOME/.nvm"
+          if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh"; fi
+          if command -v nvm >/dev/null 2>&1; then
+            nvm use --lts || nvm use 22 || true
+          fi
+          export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+          node -v && npm -v
+
           cd ~/ExplorerToken/frontend
           npm ci
           npm run build
