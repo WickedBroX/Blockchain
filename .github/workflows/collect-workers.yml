@@ -50,7 +50,7 @@ jobs:
           require_binding SSH_PRIVATE_KEY
           optional_binding SSH_PORT
 
-      - name: SSH: dump worker logs to files
+      - name: "SSH: dump worker logs to files"
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -73,7 +73,7 @@ jobs:
 
             ls -la "$OUTDIR"
 
-      - name: SCP: retrieve logs
+      - name: "SCP: retrieve logs"
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
