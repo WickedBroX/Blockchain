@@ -1,0 +1,56 @@
+name: Collect Worker Logs
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "GitHub Environment"
+        required: true
+        default: production
+      lines:
+        description: "Lines per unit"
+        required: true
+        default: "400"
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    steps:
+      - name: SSH: dump worker logs to files
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            LINES="${{ inputs.lines }}"
+            OUTDIR="$HOME/worker-logs"
+            rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
+
+            systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager \
+              | awk '{print $1}' \
+              | sed 's/.service$//' \
+              | while read -r unit; do
+                  echo "Collecting $unit ..."
+                  journalctl -u "$unit" -n "$LINES" --no-pager > "$OUTDIR/${unit}.log" || true
+                done
+
+            ls -la "$OUTDIR"
+
+      - name: SCP: retrieve logs
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "worker-logs/*"
+          target: "./"
+
+      - name: Upload logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-logs
+          path: worker-logs
