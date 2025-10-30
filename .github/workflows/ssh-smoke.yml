@@ -12,7 +12,7 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.env }}
+    environment: ${{ inputs.env }}   # must match your Environment name
     steps:
       - name: Show environment
         run: echo "Using environment: ${{ inputs.env }}"
@@ -25,7 +25,7 @@ jobs:
           test -n "${{ secrets.SSH_PORT }}"        || (echo "MISSING: SSH_PORT" && exit 1)
           echo "All required secrets are present."
 
-      - name: Set up SSH agent
+      - name: Start ssh-agent and add key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -37,6 +37,7 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts
+          echo "known_hosts updated for $SSH_HOST:${SSH_PORT:-22}"
 
       - name: SSH debug (vvv)
         env:
