@@ -21,8 +21,9 @@ jobs:
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT || '22' }}
+          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
           script: |
             set -euo pipefail
             LINES="${{ inputs.lines }}"
@@ -30,8 +31,7 @@ jobs:
             rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
 
             systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager \
-              | awk '{print $1}' \
-              | sed 's/.service$//' \
+              | awk '{print $1}' | sed 's/.service$//' \
               | while read -r unit; do
                   echo "Collecting $unit ..."
                   journalctl -u "$unit" -n "$LINES" --no-pager > "$OUTDIR/${unit}.log" || true
@@ -44,7 +44,7 @@ jobs:
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT || '22' }}
+          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "worker-logs/*"
           target: "./"
