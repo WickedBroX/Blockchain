@@ -1,56 +1,99 @@
-name: Collect Worker Logs
-on:
-  workflow_dispatch:
-    inputs:
-      env:
-        description: "GitHub Environment"
-        required: true
-        default: production
-      lines:
-        description: "Lines per unit"
-        required: true
-        default: "400"
+- name: Deploy over SSH (build on VPS, NVM-safe)
+  uses: appleboy/ssh-action@v1.0.3
+  env:
+    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}   # optional
+    WEB_ROOT: ${{ vars.WEB_ROOT }}                 # optional
+  with:
+    host: ${{ secrets.SSH_HOST }}
+    username: ${{ secrets.SSH_USER }}
+    port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
+    key: ${{ secrets.SSH_PRIVATE_KEY }}
+    command_timeout: 30m
+    envs: SUDO_PASSWORD,WEB_ROOT
+    script: |
+      set -euo pipefail
 
-jobs:
-  collect:
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.env }}
-    steps:
-      - name: SSH: dump worker logs to files
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 15m
-          script: |
-            set -euo pipefail
-            LINES="${{ inputs.lines }}"
-            OUTDIR="$HOME/worker-logs"
-            rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
+      BRANCH="${{ inputs.branch }}"
 
-            systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager \
-              | awk '{print $1}' | sed 's/.service$//' \
-              | while read -r unit; do
-                  echo "Collecting $unit ..."
-                  journalctl -u "$unit" -n "$LINES" --no-pager > "$OUTDIR/${unit}.log" || true
-                done
+      if [ -n "${SUDO_PASSWORD:-}" ]; then
+        SUDO='echo "$SUDO_PASSWORD" | sudo -S'
+      else
+        SUDO='sudo'
+      fi
 
-            ls -la "$OUTDIR"
+      mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-      - name: SCP: retrieve logs
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "worker-logs/*"
-          target: "./"
+      # NVM bootstrap (non-interactive shell)
+      export NVM_DIR="$HOME/.nvm"
+      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+      export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+      node -v
+      npm -v
 
-      - name: Upload logs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: worker-logs
-          path: worker-logs
+      # --- Backend ---
+      cd "$BACKEND_DIR"
+      if [ ! -d .git ]; then
+        git init
+        git remote add origin https://github.com/WickedBroX/Blockchain.git
+      fi
+
+      # ensure correct origin (no runner envs on remote)
+      CUR=$(git remote get-url origin || true)
+      if [ "$CUR" != "https://github.com/WickedBroX/Blockchain.git" ]; then
+        git remote set-url origin https://github.com/WickedBroX/Blockchain.git
+      fi
+
+      # branch detection (prefer input)
+      DEF="${BRANCH}"
+      if [ -z "${DEF:-}" ]; then
+        DEF=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+        [ -z "$DEF" ] && DEF=main
+      fi
+
+      git fetch --prune origin
+      git checkout -B "$DEF" "origin/$DEF"
+
+      echo "Installing backend deps..."
+      npm ci
+      echo "Building backend..."
+      npm run build
+
+      echo "Restarting backend service..."
+      $SUDO /usr/bin/systemctl restart explorertoken-backend
+      sleep 2
+      echo "Backend health:"
+      curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
+
+      # --- Frontend ---
+      cd "$FRONTEND_DIR"
+      if [ ! -d .git ]; then
+        git init
+        git remote add origin https://github.com/WickedBroX/Blockchain.git
+      fi
+      git fetch --prune origin
+      git checkout -B "$DEF" "origin/$DEF"
+
+      echo "Installing frontend deps..."
+      npm ci
+      echo "Building frontend..."
+      npm run build
+
+      # Detect Nginx web root for haswork.dev, fallback to /var/www/haswork.dev
+      if [ -z "${WEB_ROOT:-}" ]; then
+        CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
+        if [ -n "$CAND" ]; then
+          WEB_ROOT=$(awk '/root\\s+/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+        fi
+        WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
+      fi
+      echo "WEB_ROOT => $WEB_ROOT"
+
+      echo "Syncing frontend dist → WEB_ROOT"
+      $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
+
+      echo "Testing Nginx config..."
+      $SUDO /usr/sbin/nginx -t
+      echo "Reloading Nginx..."
+      $SUDO /usr/bin/systemctl reload nginx
+
+      journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
