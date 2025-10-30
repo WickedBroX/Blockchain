@@ -45,7 +45,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
-          key: ${{ secrets.SSH_PRIVATEKEY }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "worker-logs/*"
           target: "./"
 
