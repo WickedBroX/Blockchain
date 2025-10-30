@@ -28,7 +28,7 @@ jobs:
       - name: Start ssh-agent and add key
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh-private-key: ${{ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhGphlBRU2/aqlBBhQHtONyl6V2P2sj7ShW/SAgxtkE gh-actions@server1 }}
 
       - name: Add host to known_hosts
         env:
