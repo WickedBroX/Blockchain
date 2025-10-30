@@ -36,30 +36,26 @@ jobs:
         run: |
           ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
 
-      # ---------------------------
-      # Backend build & restart
-      # ---------------------------
       - name: Backend deploy
         env:
-          REPO: ${{ github.repository }}          # expands on the runner (e.g. WickedBroX/Blockchain)
+          REPO: ${{ github.repository }}        # expanded on RUNNER (e.g. WickedBroX/Blockchain)
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
-          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }} # <-- uncomment only if you choose Option 2
+          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }}   # uncomment if using Option 2 (sudo -S)
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<EOF
           set -eo pipefail
           cd ~/ExplorerToken
 
-          # repo URL injection is expanded on the runner
+          # point origin to repo via SSH; NOTE: \$REPO is expanded by runner before sending
           git remote set-url origin git@github.com:${REPO}.git || true
           git fetch --prune
-
           DEF=\$(git remote show origin | sed -n 's/.*HEAD branch: //p'); [ -z "\$DEF" ] && DEF=main
           git checkout -B "\$DEF"
           git reset --hard "origin/\$DEF"
 
-          # --- Node/NPM for non-interactive shell (NVM) ---
+          # nvm/npm in non-interactive shell
           export NVM_DIR="\$HOME/.nvm"
           [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
           command -v nvm >/dev/null 2>&1 && { nvm use --lts || nvm use 22 || true; }
@@ -70,25 +66,22 @@ jobs:
           npm ci
           npm run build
 
-          # ---- SUDO OPTION 1: passwordless sudo (recommended) ----
+          # SUDO OPTION 1: passwordless sudo (recommended; add a sudoers entry)
           sudo systemctl restart explorertoken-backend
 
-          # ---- SUDO OPTION 2: with password secret ----
+          # SUDO OPTION 2: sudo with password (uncomment below + set SUDO_PASSWORD secret)
           # sudo_pw() { echo "\$SUDO_PW" | sudo -S "\$@"; }
           # sudo_pw systemctl restart explorertoken-backend
 
           curl -sS http://127.0.0.1:4000/health || true
           EOF
 
-      # ---------------------------
-      # Frontend build & publish
-      # ---------------------------
       - name: Frontend deploy
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
-          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }} # <-- uncomment only if you choose Option 2
+          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }}   # uncomment if using Option 2
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'EOF'
           set -eo pipefail
@@ -111,12 +104,12 @@ jobs:
           )
           [ -n "$WEB_ROOT" ] || WEB_ROOT="/var/www/haswork.dev"
 
-          # ---- SUDO OPTION 1: passwordless sudo ----
+          # SUDO OPTION 1: passwordless sudo
           sudo rsync -av --delete dist/ "$WEB_ROOT"/
           sudo nginx -t
           sudo systemctl reload nginx
 
-          # ---- SUDO OPTION 2: with password secret ----
+          # SUDO OPTION 2: with password
           # sudo_pw() { echo "$SUDO_PW" | sudo -S "$@"; }
           # sudo_pw rsync -av --delete dist/ "$WEB_ROOT"/
           # sudo_pw nginx -t
@@ -132,7 +125,6 @@ jobs:
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
             "sudo journalctl -u explorertoken-backend -n 300 --no-pager" > backend_logs.txt || true
           tar -czf logs.tgz backend_logs.txt
-          echo "If empty, service is healthy."
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
