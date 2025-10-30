@@ -119,15 +119,7 @@ jobs:
             echo "WEB_ROOT => $WEB_ROOT"
 
             echo "Syncing frontend dist → WEB_ROOT"
-            BUILD_DIST_DIR="$FRONTEND_DIR/dist"
-            if [ ! -d "$BUILD_DIST_DIR" ] && [ -d "$FRONTEND_DIR/frontend/dist" ]; then
-              BUILD_DIST_DIR="$FRONTEND_DIR/frontend/dist"
-            fi
-            if [ ! -d "$BUILD_DIST_DIR" ]; then
-              echo "ERROR: Frontend dist directory not found at '$FRONTEND_DIR/dist' or '$FRONTEND_DIR/frontend/dist'" >&2
-              exit 1
-            fi
-            $SUDO /usr/bin/rsync -a --delete "$BUILD_DIST_DIR/" "$WEB_ROOT"/
+            $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
 
             echo "Testing Nginx config..."
             $SUDO /usr/sbin/nginx -t
