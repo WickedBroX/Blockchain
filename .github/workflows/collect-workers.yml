@@ -16,6 +16,40 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.env }}
     steps:
+      - name: Assert environment bindings (presence only)
+        run: |
+          set -euo pipefail
+
+          export SSH_HOST="${{ secrets.SSH_HOST }}"
+          export SSH_USER="${{ secrets.SSH_USER }}"
+          export SSH_PRIVATE_KEY="${{ secrets.SSH_PRIVATE_KEY }}"
+          export SSH_PORT="${{ secrets.SSH_PORT }}"
+
+          echo "Verifying SSH bindings for environment '${{ inputs.env }}'..."
+
+          require_binding() {
+            local name="$1"
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required SSH binding '$name' for environment '${{ inputs.env }}'"
+              exit 1
+            fi
+            echo "✔ Required binding '$name' is present."
+          }
+
+          optional_binding() {
+            local name="$1"
+            if [ -z "${!name:-}" ]; then
+              echo "ℹ Optional binding '$name' not provided for environment '${{ inputs.env }}'."
+            else
+              echo "✔ Optional binding '$name' is present."
+            fi
+          }
+
+          require_binding SSH_HOST
+          require_binding SSH_USER
+          require_binding SSH_PRIVATE_KEY
+          optional_binding SSH_PORT
+
       - name: SSH: dump worker logs to files
         uses: appleboy/ssh-action@v1.0.3
         with:
