@@ -1,3 +1,43 @@
+- name: Assert environment bindings (presence only)
+  shell: bash
+  env:
+    SSH_HOST: ${{ secrets.SSH_HOST }}
+    SSH_USER: ${{ secrets.SSH_USER }}
+    SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+    SSH_PORT: ${{ secrets.SSH_PORT }}
+    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+    WEB_ROOT: ${{ vars.WEB_ROOT }}
+  run: |
+    set -euo pipefail
+
+    env_label="${{ inputs.env }}"
+    missing=0
+
+    required=(SSH_HOST SSH_USER SSH_PRIVATE_KEY)
+    optional=(SSH_PORT SUDO_PASSWORD WEB_ROOT)
+
+    for var in "${required[@]}"; do
+      value="${!var:-}"
+      if [ -z "$value" ]; then
+        echo "::error title=${env_label} environment::${var} is required but not set"
+        missing=1
+      else
+        echo "::notice title=${env_label} environment::${var} is present"
+      fi
+    done
+
+    for var in "${optional[@]}"; do
+      value="${!var:-}"
+      if [ -n "$value" ]; then
+        echo "::notice title=${env_label} environment::${var} is present (optional)"
+      else
+        echo "::notice title=${env_label} environment::${var} not provided (optional)"
+      fi
+    done
+
+    if [ "$missing" -eq 1 ]; then
+      exit 1
+    fi
 - name: Deploy over SSH (build on VPS, NVM-safe)
   uses: appleboy/ssh-action@v1.0.3
   env:
