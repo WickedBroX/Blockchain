@@ -14,7 +14,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Bind the job to the Environment where your SSH_* secrets live
     environment: ${{ inputs.env || 'production' }}
 
     steps:
@@ -37,25 +36,22 @@ jobs:
         run: |
           ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
 
-      # ---------------------------
-      # Backend build & restart
-      # ---------------------------
       - name: Backend deploy
         env:
-          REPO: ${{ github.repository }}  # e.g. WickedBroX/Blockchain
+          REPO: ${{ github.repository }}          # e.g. WickedBroX/Blockchain
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<EOF
-          set -euo pipefail
+          set -eo pipefail
           cd ~/ExplorerToken
 
-          # Point origin to the new repo via SSH
+          # Point origin to new repo over SSH (runner expanded \$REPO above)
           git remote set-url origin git@github.com:${REPO}.git || true
           git fetch --prune
 
-          # Detect default branch robustly
+          # Robust default-branch detection
           DEF=\$(git remote show origin | sed -n 's/.*HEAD branch: //p')
           [ -z "\$DEF" ] && DEF=main
 
@@ -69,9 +65,6 @@ jobs:
           curl -sS http://127.0.0.1:4000/health || true
           EOF
 
-      # ---------------------------
-      # Frontend build & publish
-      # ---------------------------
       - name: Frontend deploy
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
@@ -79,7 +72,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'EOF'
-          set -euo pipefail
+          set -eo pipefail
           cd ~/ExplorerToken/frontend
           npm ci
           npm run build
