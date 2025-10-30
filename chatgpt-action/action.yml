@@ -1,0 +1,89 @@
+name: 'chatgpt-action'
+description: 'A collection of ChatGPT assistants, e.g., code viewer, labeler, assigner, etc.'
+author: 'Tao He'
+inputs:
+  action:
+    type: string
+    required: false
+    description: 'The action to run, currently can be "review", "score"'
+    default: 'review'
+  debug:
+    type: boolean
+    required: false
+    description: 'Enable debug mode'
+    default: false
+  path_filters:
+    type: string
+    required: false
+    description: |
+      The path filters, e.g., "src/**.py", "!dist/**", each line will be considered as one pattern.
+      See also
+
+      - https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore
+      - https://github.com/isaacs/minimatch
+    default: |
+      !dist/**
+      **/package-lock.json
+  chatgpt_reverse_proxy:
+    type: boolean
+    required: false
+    description: |
+      The URL of the chatgpt reverse proxy, see also https://github.com/transitive-bullshit/chatgpt-api#reverse-proxy
+    default: https://chat.duti.tech/api/conversation
+  review_comment_lgtm:
+    type: boolean
+    required: false
+    description: 'Leave comments even the patch is LGTM'
+    default: false
+  review_beginning:
+    type: string
+    required: false
+    description: "The beginning prompt of a code review dialog"
+    default: |
+      Hi ChatGPT, I have a pull request with title "$title" and the description is as follows,
+
+      > $description.
+
+      Next, I will given you a series of patches, each of them consists of a filename and a diff
+      snippet, and you need to do a brief code review for every message, and tell me any bug risk
+      and improvement suggestion. If the patch is looks good and acceptable, please reply "LGTM!"
+      with a short comment with 30 words.
+
+      You answer should be concise. Don't include the diff in your comment, and markdown format is
+      preferred. Reply "OK" to confirm.
+  review_patch:
+    type: string
+    required: false
+    description: 'The prompt for each chunks/patches'
+    default: |
+      $filename
+
+      ```diff
+      $patch
+      ```
+  scoring_beginning:
+    type: string
+    required: false
+    description: 'The prompt for the whole pull request'
+    default: |
+      Hi ChatGPT, I have a pull request with title "$title" and the description is as follows,
+
+      > $description
+
+      I would like score the pull request, the score should be a number between 0 and 100
+      and 85 means the the pull request is basically acceptable. You just need to reply a
+      number between 0 and 100, e.g., "85", and a comment within 30 words. Next, I would
+      give you the whole diff of the pull request. Reply "OK" to confirm.
+  scoring:
+    type: string
+    required: false
+    description: 'The prompt for the whole diff for scoring'
+    default: |
+      The diff is as follows:
+
+      ```diff
+      $diff
+      ```
+runs:
+  using: 'node16'
+  main: 'dist/index.js'
