@@ -22,21 +22,29 @@ jobs:
     environment: ${{ inputs.env }}
     steps:
       - name: Assert required secrets
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          for k in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
-            test -n "${{ secrets[$k] }}" || (echo "Missing $k" && exit 1)
-          done
+          test -n "${SSH_HOST}" || (echo "Missing SSH_HOST" && exit 1)
+          test -n "${SSH_USER}" || (echo "Missing SSH_USER" && exit 1)
+          test -n "${SSH_PRIVATE_KEY}" || (echo "Missing SSH_PRIVATE_KEY" && exit 1)
           echo "Secrets OK"
 
       - name: Deploy over SSH (build on VPS, NVM-safe)
         uses: appleboy/ssh-action@v1.0.3
-        envs: SUDO_PASSWORD, WEB_ROOT
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          WEB_ROOT: ${{ vars.WEB_ROOT }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT || '22' }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 30m
+          envs: SUDO_PASSWORD,WEB_ROOT
           script: |
             set -euo pipefail
 
@@ -55,7 +63,6 @@ jobs:
             # NVM bootstrap
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-            # Fallback PATH to a known Node path if needed
             export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
             echo "node: $(command -v node || true)"
             node -v || (echo "Node is required via NVM"; exit 1)
@@ -125,7 +132,7 @@ jobs:
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT || '22' }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "server-logs.txt"
           target: "./"
