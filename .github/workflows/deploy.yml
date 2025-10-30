@@ -1,133 +1,137 @@
 name: Deploy to VPS
-
 on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Environment that holds SSH_* secrets"
-        default: production
+        description: "GitHub Environment"
         required: true
-        type: string
-  push:
-    branches: [ "main" ]
+        default: production
+      branch:
+        description: "Branch to deploy"
+        required: true
+        default: main
+
+env:
+  REPO_URL: https://github.com/WickedBroX/Blockchain.git
+  BACKEND_DIR: /home/deploy/ExplorerToken/backend
+  FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.env || 'production' }}
-
+    environment: ${{ inputs.env }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Assert SSH secrets exist
+      - name: Assert required secrets
         run: |
-          test -n "${{ secrets.SSH_PRIVATE_KEY }}" || (echo "MISSING: SSH_PRIVATE_KEY" && exit 1)
-          test -n "${{ secrets.SSH_HOST }}"        || (echo "MISSING: SSH_HOST" && exit 1)
-          test -n "${{ secrets.SSH_USER }}"        || (echo "MISSING: SSH_USER" && exit 1)
-          test -n "${{ secrets.SSH_PORT }}"        || (echo "MISSING: SSH_PORT" && exit 1)
+          for k in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
+            test -n "${{ secrets[$k] }}" || (echo "Missing $k" && exit 1)
+          done
+          echo "Secrets OK"
 
-      - name: Start ssh-agent
-        uses: webfactory/ssh-agent@v0.9.0
+      - name: Deploy over SSH (build on VPS, NVM-safe)
+        uses: appleboy/ssh-action@v1.0.3
+        envs: SUDO_PASSWORD, WEB_ROOT
         with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
 
-      - name: Trust host
-        run: |
-          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+            BRANCH="${{ inputs.branch }}"
 
-      - name: Backend deploy
-        env:
-          REPO: ${{ github.repository }}        # expanded on RUNNER (e.g. WickedBroX/Blockchain)
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }}   # uncomment if using Option 2 (sudo -S)
-        run: |
-          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<EOF
-          set -eo pipefail
-          cd ~/ExplorerToken
+            # Choose sudo mode
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              SUDO='echo "$SUDO_PASSWORD" | sudo -S'
+            else
+              SUDO='sudo'
+            fi
 
-          # point origin to repo via SSH; NOTE: \$REPO is expanded by runner before sending
-          git remote set-url origin git@github.com:${REPO}.git || true
-          git fetch --prune
-          DEF=\$(git remote show origin | sed -n 's/.*HEAD branch: //p'); [ -z "\$DEF" ] && DEF=main
-          git checkout -B "\$DEF"
-          git reset --hard "origin/\$DEF"
+            # Ensure dirs
+            mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-          # nvm/npm in non-interactive shell
-          export NVM_DIR="\$HOME/.nvm"
-          [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
-          command -v nvm >/dev/null 2>&1 && { nvm use --lts || nvm use 22 || true; }
-          export PATH="\$HOME/.nvm/versions/node/v22.21.0/bin:\$PATH"
-          node -v && npm -v
+            # NVM bootstrap
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            # Fallback PATH to a known Node path if needed
+            export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+            echo "node: $(command -v node || true)"
+            node -v || (echo "Node is required via NVM"; exit 1)
+            npm -v
 
-          cd backend
-          npm ci
-          npm run build
+            # --- Backend ---
+            cd "$BACKEND_DIR"
+            if [ -d .git ]; then
+              git remote -v || true
+              git fetch --prune origin || git remote add origin "$REPO_URL"
+            else
+              git init
+              git remote add origin "$REPO_URL"
+            fi
+            git fetch --prune origin
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            echo "Installing backend deps..."
+            npm ci
+            echo "Building backend..."
+            npm run build
 
-          # SUDO OPTION 1: passwordless sudo (recommended; add a sudoers entry)
-          sudo systemctl restart explorertoken-backend
+            echo "Restarting backend service..."
+            $SUDO /usr/bin/systemctl restart explorertoken-backend
+            sleep 2
+            echo "Backend health:"
+            curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
 
-          # SUDO OPTION 2: sudo with password (uncomment below + set SUDO_PASSWORD secret)
-          # sudo_pw() { echo "\$SUDO_PW" | sudo -S "\$@"; }
-          # sudo_pw systemctl restart explorertoken-backend
+            # --- Frontend ---
+            cd "$FRONTEND_DIR"
+            if [ -d .git ]; then
+              git fetch --prune origin || git remote add origin "$REPO_URL"
+            else
+              git init
+              git remote add origin "$REPO_URL"
+            fi
+            git fetch --prune origin
+            git checkout -B "$BRANCH" "origin/$BRANCH"
 
-          curl -sS http://127.0.0.1:4000/health || true
-          EOF
+            echo "Installing frontend deps..."
+            npm ci
+            echo "Building frontend..."
+            npm run build
 
-      - name: Frontend deploy
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          # SUDO_PW: ${{ secrets.SUDO_PASSWORD }}   # uncomment if using Option 2
-        run: |
-          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" <<'EOF'
-          set -eo pipefail
+            # Detect Nginx web root for haswork.dev, fallback to /var/www/haswork.dev
+            if [ -z "${WEB_ROOT:-}" ]; then
+              CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
+              if [ -n "$CAND" ]; then
+                WEB_ROOT=$(awk '/root\\s+/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+              fi
+              WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
+            fi
+            echo "WEB_ROOT => $WEB_ROOT"
 
-          export NVM_DIR="$HOME/.nvm"
-          [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-          command -v nvm >/dev/null 2>&1 && { nvm use --lts || nvm use 22 || true; }
-          export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
-          node -v && npm -v
+            echo "Syncing frontend dist → WEB_ROOT"
+            $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
 
-          cd ~/ExplorerToken/frontend
-          npm ci
-          npm run build
+            echo "Testing Nginx config..."
+            $SUDO /usr/sbin/nginx -t
+            echo "Reloading Nginx..."
+            $SUDO /usr/bin/systemctl reload nginx
 
-          WEB_ROOT=$(
-            sudo nginx -T 2>/dev/null | awk '
-              /server_name[^\n]*haswork\.dev/ { ins=1 }
-              ins && $1=="root" { gsub(";","",$2); print $2; exit }
-              ins && /}/ { ins=0 }'
-          )
-          [ -n "$WEB_ROOT" ] || WEB_ROOT="/var/www/haswork.dev"
+            # Save backend logs to home for pickup
+            journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
 
-          # SUDO OPTION 1: passwordless sudo
-          sudo rsync -av --delete dist/ "$WEB_ROOT"/
-          sudo nginx -t
-          sudo systemctl reload nginx
+      - name: Pull back server logs (artifact)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "server-logs.txt"
+          target: "./"
 
-          # SUDO OPTION 2: with password
-          # sudo_pw() { echo "$SUDO_PW" | sudo -S "$@"; }
-          # sudo_pw rsync -av --delete dist/ "$WEB_ROOT"/
-          # sudo_pw nginx -t
-          # sudo_pw systemctl reload nginx
-          EOF
-
-      - name: Collect backend logs (artifact)
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-        run: |
-          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "sudo journalctl -u explorertoken-backend -n 300 --no-pager" > backend_logs.txt || true
-          tar -czf logs.tgz backend_logs.txt
-
-      - name: Upload logs
+      - name: Upload backend logs artifact
         uses: actions/upload-artifact@v4
         with:
           name: server-logs
-          path: logs.tgz
+          path: server-logs.txt
