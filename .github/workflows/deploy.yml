@@ -1,99 +1,125 @@
-- name: Deploy over SSH (build on VPS, NVM-safe)
-  uses: appleboy/ssh-action@v1.0.3
-  env:
-    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}   # optional
-    WEB_ROOT: ${{ vars.WEB_ROOT }}                 # optional
-  with:
-    host: ${{ secrets.SSH_HOST }}
-    username: ${{ secrets.SSH_USER }}
-    port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
-    key: ${{ secrets.SSH_PRIVATE_KEY }}
-    command_timeout: 30m
-    envs: SUDO_PASSWORD,WEB_ROOT
-    script: |
-      set -euo pipefail
+name: Deploy
 
-      BRANCH="${{ inputs.branch }}"
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Git branch to deploy
+        required: false
+        default: main
+      backend_dir:
+        description: Remote backend working directory
+        required: false
+      frontend_dir:
+        description: Remote frontend working directory
+        required: false
 
-      if [ -n "${SUDO_PASSWORD:-}" ]; then
-        SUDO='echo "$SUDO_PASSWORD" | sudo -S'
-      else
-        SUDO='sudo'
-      fi
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: ${{ github.event.inputs.branch || vars.DEPLOY_BRANCH || 'main' }}
+      BACKEND_DIR: ${{ github.event.inputs.backend_dir || vars.BACKEND_DIR }}
+      FRONTEND_DIR: ${{ github.event.inputs.frontend_dir || vars.FRONTEND_DIR }}
+    steps:
+      - name: Deploy over SSH (build on VPS, NVM-safe)
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          WEB_ROOT: ${{ vars.WEB_ROOT }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,BRANCH
+          script: |
+            set -euo pipefail
 
-      mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
+            : "${BRANCH:=}"
+            : "${BACKEND_DIR:="$HOME/Blockchain/backend"}"
+            : "${FRONTEND_DIR:="$HOME/Blockchain/frontend"}"
 
-      # NVM bootstrap (non-interactive shell)
-      export NVM_DIR="$HOME/.nvm"
-      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-      export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
-      node -v
-      npm -v
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              SUDO='echo "$SUDO_PASSWORD" | sudo -S'
+            else
+              SUDO='sudo'
+            fi
 
-      # --- Backend ---
-      cd "$BACKEND_DIR"
-      if [ ! -d .git ]; then
-        git init
-        git remote add origin https://github.com/WickedBroX/Blockchain.git
-      fi
+            mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-      # ensure correct origin (no runner envs on remote)
-      CUR=$(git remote get-url origin || true)
-      if [ "$CUR" != "https://github.com/WickedBroX/Blockchain.git" ]; then
-        git remote set-url origin https://github.com/WickedBroX/Blockchain.git
-      fi
+            # NVM bootstrap (non-interactive shell)
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+            node -v
+            npm -v
 
-      # branch detection (prefer input)
-      DEF="${BRANCH}"
-      if [ -z "${DEF:-}" ]; then
-        DEF=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
-        [ -z "$DEF" ] && DEF=main
-      fi
+            # --- Backend ---
+            cd "$BACKEND_DIR"
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin https://github.com/WickedBroX/Blockchain.git
+            fi
 
-      git fetch --prune origin
-      git checkout -B "$DEF" "origin/$DEF"
+            # ensure correct origin (no runner envs on remote)
+            CUR=$(git remote get-url origin || true)
+            if [ "$CUR" != "https://github.com/WickedBroX/Blockchain.git" ]; then
+              git remote set-url origin https://github.com/WickedBroX/Blockchain.git
+            fi
 
-      echo "Installing backend deps..."
-      npm ci
-      echo "Building backend..."
-      npm run build
+            # branch detection (prefer input)
+            DEF="${BRANCH}"
+            if [ -z "${DEF:-}" ]; then
+              DEF=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+              [ -z "$DEF" ] && DEF=main
+            fi
 
-      echo "Restarting backend service..."
-      $SUDO /usr/bin/systemctl restart explorertoken-backend
-      sleep 2
-      echo "Backend health:"
-      curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
+            git fetch --prune origin
+            git checkout -B "$DEF" "origin/$DEF"
 
-      # --- Frontend ---
-      cd "$FRONTEND_DIR"
-      if [ ! -d .git ]; then
-        git init
-        git remote add origin https://github.com/WickedBroX/Blockchain.git
-      fi
-      git fetch --prune origin
-      git checkout -B "$DEF" "origin/$DEF"
+            echo "Installing backend deps..."
+            npm ci
+            echo "Building backend..."
+            npm run build
 
-      echo "Installing frontend deps..."
-      npm ci
-      echo "Building frontend..."
-      npm run build
+            echo "Restarting backend service..."
+            $SUDO /usr/bin/systemctl restart explorertoken-backend
+            sleep 2
+            echo "Backend health:"
+            curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
 
-      # Detect Nginx web root for haswork.dev, fallback to /var/www/haswork.dev
-      if [ -z "${WEB_ROOT:-}" ]; then
-        CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
-        if [ -n "$CAND" ]; then
-          WEB_ROOT=$(awk '/root\\s+/{print $2}' "$CAND" | tr -d ';' | tail -n1)
-        fi
-        WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
-      fi
-      echo "WEB_ROOT => $WEB_ROOT"
+            # --- Frontend ---
+            cd "$FRONTEND_DIR"
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin https://github.com/WickedBroX/Blockchain.git
+            fi
+            git fetch --prune origin
+            git checkout -B "$DEF" "origin/$DEF"
 
-      echo "Syncing frontend dist → WEB_ROOT"
-      $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
+            echo "Installing frontend deps..."
+            npm ci
+            echo "Building frontend..."
+            npm run build
 
-      echo "Testing Nginx config..."
-      $SUDO /usr/sbin/nginx -t
-      echo "Reloading Nginx..."
-      $SUDO /usr/bin/systemctl reload nginx
+            # Detect Nginx web root for haswork.dev, fallback to /var/www/haswork.dev
+            if [ -z "${WEB_ROOT:-}" ]; then
+              CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
+              if [ -n "$CAND" ]; then
+                WEB_ROOT=$(awk '/root\\s+/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+              fi
+              WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
+            fi
+            echo "WEB_ROOT => $WEB_ROOT"
 
-      journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
+            echo "Syncing frontend dist → WEB_ROOT"
+            $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
+
+            echo "Testing Nginx config..."
+            $SUDO /usr/sbin/nginx -t
+            echo "Reloading Nginx..."
+            $SUDO /usr/bin/systemctl reload nginx
+
+            journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
