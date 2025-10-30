@@ -1,55 +1,70 @@
-name: Deploy
-
+name: Deploy to VPS
 on:
   workflow_dispatch:
     inputs:
+      env:
+        description: "GitHub Environment"
+        required: true
+        default: production
       branch:
-        description: Git branch to deploy
-        required: false
+        description: "Branch to deploy"
+        required: true
         default: main
-      backend_dir:
-        description: Remote backend working directory
-        required: false
-      frontend_dir:
-        description: Remote frontend working directory
-        required: false
+
+env:
+  REPO_URL: https://github.com/WickedBroX/Blockchain.git
+  BACKEND_DIR: /home/deploy/ExplorerToken/backend
+  FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      BRANCH: ${{ github.event.inputs.branch || vars.DEPLOY_BRANCH || 'main' }}
-      BACKEND_DIR: ${{ github.event.inputs.backend_dir || vars.BACKEND_DIR }}
-      FRONTEND_DIR: ${{ github.event.inputs.frontend_dir || vars.FRONTEND_DIR }}
+    environment: ${{ inputs.env }}
     steps:
+      - name: Assert required secrets
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${SSH_HOST}" || (echo "Missing SSH_HOST" && exit 1)
+          test -n "${SSH_USER}" || (echo "Missing SSH_USER" && exit 1)
+          test -n "${SSH_PRIVATE_KEY}" || (echo "Missing SSH_PRIVATE_KEY" && exit 1)
+          echo "Secrets OK"
+
       - name: Deploy over SSH (build on VPS, NVM-safe)
         uses: appleboy/ssh-action@v1.0.3
         env:
+          # Optional: only if you didn't configure NOPASSWD sudoers
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          # Optional: set this Env Var in the Environment for clarity
           WEB_ROOT: ${{ vars.WEB_ROOT }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || '22' }}
+          # If SSH_PORT secret is missing/empty, default to 22
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 30m
-          envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,BRANCH
+          envs: SUDO_PASSWORD,WEB_ROOT
           script: |
             set -euo pipefail
 
-            : "${BRANCH:=}"
-            : "${BACKEND_DIR:="$HOME/Blockchain/backend"}"
-            : "${FRONTEND_DIR:="$HOME/Blockchain/frontend"}"
+            BRANCH="${{ inputs.branch }}"
 
+            # Choose sudo strategy
             if [ -n "${SUDO_PASSWORD:-}" ]; then
               SUDO='echo "$SUDO_PASSWORD" | sudo -S'
             else
               SUDO='sudo'
             fi
 
+            # Ensure dirs
             mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-            # NVM bootstrap (non-interactive shell)
+            # --- NVM bootstrap (non-interactive shell) ---
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
             export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
@@ -60,24 +75,15 @@ jobs:
             cd "$BACKEND_DIR"
             if [ ! -d .git ]; then
               git init
-              git remote add origin https://github.com/WickedBroX/Blockchain.git
+              git remote add origin "$REPO_URL"
             fi
-
-            # ensure correct origin (no runner envs on remote)
+            # ensure origin is correct
             CUR=$(git remote get-url origin || true)
-            if [ "$CUR" != "https://github.com/WickedBroX/Blockchain.git" ]; then
-              git remote set-url origin https://github.com/WickedBroX/Blockchain.git
+            if [ "$CUR" != "$REPO_URL" ]; then
+              git remote set-url origin "$REPO_URL"
             fi
-
-            # branch detection (prefer input)
-            DEF="${BRANCH}"
-            if [ -z "${DEF:-}" ]; then
-              DEF=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
-              [ -z "$DEF" ] && DEF=main
-            fi
-
             git fetch --prune origin
-            git checkout -B "$DEF" "origin/$DEF"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
 
             echo "Installing backend deps..."
             npm ci
@@ -94,21 +100,26 @@ jobs:
             cd "$FRONTEND_DIR"
             if [ ! -d .git ]; then
               git init
-              git remote add origin https://github.com/WickedBroX/Blockchain.git
+              git remote add origin "$REPO_URL"
+            fi
+            CUR=$(git remote get-url origin || true)
+            if [ "$CUR" != "$REPO_URL" ]; then
+              git remote set-url origin "$REPO_URL"
             fi
             git fetch --prune origin
-            git checkout -B "$DEF" "origin/$DEF"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
 
             echo "Installing frontend deps..."
             npm ci
             echo "Building frontend..."
             npm run build
 
-            # Detect Nginx web root for haswork.dev, fallback to /var/www/haswork.dev
+            # Detect web root or fallback
             if [ -z "${WEB_ROOT:-}" ]; then
+              # try to find haswork.dev root from nginx config
               CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
               if [ -n "$CAND" ]; then
-                WEB_ROOT=$(awk '/root\\s+/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+                WEB_ROOT=$(awk '/\\sroot\\s/{print $2}' "$CAND" | tr -d ';' | tail -n1)
               fi
               WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
             fi
@@ -122,4 +133,21 @@ jobs:
             echo "Reloading Nginx..."
             $SUDO /usr/bin/systemctl reload nginx
 
+            # Save backend logs for artifact
             journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
+
+      - name: Pull back server logs (artifact)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "server-logs.txt"
+          target: "./"
+
+      - name: Upload backend logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs
+          path: server-logs.txt
