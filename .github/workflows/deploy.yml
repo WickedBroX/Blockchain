@@ -45,11 +45,11 @@
     SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
     # Optional: set this in the Environment
     WEB_ROOT: ${{ vars.WEB_ROOT }}
+    GITHUB_REPOSITORY: ${{ github.repository }}
 
     # IMPORTANT: forward these to the remote shell
     BACKEND_DIR: /home/deploy/ExplorerToken/backend
     FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
-    REPO_URL: https://github.com/WickedBroX/Blockchain.git
   with:
     host: ${{ secrets.SSH_HOST }}
     username: ${{ secrets.SSH_USER }}
@@ -57,11 +57,18 @@
     key: ${{ secrets.SSH_PRIVATE_KEY }}
     command_timeout: 30m
     # Forward step envs to remote session:
-    envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,REPO_URL
+    envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,GITHUB_REPOSITORY
     script: |
       set -euo pipefail
 
       BRANCH="${{ inputs.branch }}"
+
+      if [ -z "${GITHUB_REPOSITORY:-}" ]; then
+        echo "::error::GITHUB_REPOSITORY is not set"
+        exit 1
+      fi
+
+      REPO_URL="git@github.com:${GITHUB_REPOSITORY}.git"
 
       # Choose sudo strategy
       if [ -n "${SUDO_PASSWORD:-}" ]; then
