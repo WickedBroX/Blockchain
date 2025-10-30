@@ -37,10 +37,8 @@ jobs:
       - name: Deploy over SSH (build on VPS, NVM-safe)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Optional: set only if you didn’t grant NOPASSWD sudo
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-          # Optional: environment variable WEB_ROOT (GitHub Env → production)
-          WEB_ROOT: ${{ vars.WEB_ROOT }}
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}   # optional
+          WEB_ROOT: ${{ vars.WEB_ROOT }}                 # optional
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
