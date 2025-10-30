@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Environment that contains SSH_* secrets"
+        description: "Environment with SSH_* secrets"
         default: production
         required: true
         type: string
@@ -12,39 +12,42 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.env }}   # must match your Environment name
+    environment: ${{ inputs.env }}
     steps:
-      - name: Show environment
-        run: echo "Using environment: ${{ inputs.env }}"
-
-      - name: Assert SSH secrets exist (won't print contents)
+      - name: Assert secrets exist
         run: |
           test -n "${{ secrets.SSH_PRIVATE_KEY }}" || (echo "MISSING: SSH_PRIVATE_KEY" && exit 1)
           test -n "${{ secrets.SSH_HOST }}"        || (echo "MISSING: SSH_HOST" && exit 1)
           test -n "${{ secrets.SSH_USER }}"        || (echo "MISSING: SSH_USER" && exit 1)
           test -n "${{ secrets.SSH_PORT }}"        || (echo "MISSING: SSH_PORT" && exit 1)
-          echo "All required secrets are present."
 
-      - name: Start ssh-agent and add key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      # Normalize CRLF → LF and write to a file
+      - name: Prepare private key file
+        run: |
+          umask 077
+          printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > id_gha
+          head -1 id_gha | grep -q 'BEGIN OPENSSH PRIVATE KEY' || { echo "Not an OpenSSH private key"; exit 1; }
+          tail -1 id_gha | grep -q 'END OPENSSH PRIVATE KEY'   || { echo "Key footer missing"; exit 1; }
+          wc -c id_gha
 
-      - name: Add host to known_hosts
+      - name: Start ssh-agent & add key (verbose)
+        run: |
+          eval "$(ssh-agent -s)"
+          ssh-add -vvv ./id_gha
+
+      - name: Known hosts
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts
-          echo "known_hosts updated for $SSH_HOST:${SSH_PORT:-22}"
 
-      - name: SSH debug (vvv)
+      - name: SSH debug
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
-          set -x
           ssh -vvv -o StrictHostKeyChecking=yes -p "${SSH_PORT:-22}" \
-            "$SSH_USER@$SSH_HOST" 'whoami && uname -a && echo SHELL=$SHELL && ls -la ~/ExplorerToken || true'
+              "$SSH_USER@$SSH_HOST" 'whoami; uname -a; ls -la ~/ExplorerToken || true'
