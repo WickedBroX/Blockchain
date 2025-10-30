@@ -1,0 +1,87 @@
+name: Deploy to VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment that holds SSH_* secrets"
+        default: production
+        required: true
+        type: string
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env || 'production' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert SSH secrets exist
+        run: |
+          test -n "${{ secrets.SSH_PRIVATE_KEY }}" || (echo "MISSING: SSH_PRIVATE_KEY" && exit 1)
+          test -n "${{ secrets.SSH_HOST }}"        || (echo "MISSING: SSH_HOST" && exit 1)
+          test -n "${{ secrets.SSH_USER }}"        || (echo "MISSING: SSH_USER" && exit 1)
+          test -n "${{ secrets.SSH_PORT }}"        || (echo "MISSING: SSH_PORT" && exit 1)
+
+      - name: Start ssh-agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Trust host
+        run: |
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Backend build & restart
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" <<'SSH'
+          set -euo pipefail
+          cd ~/ExplorerToken
+          git remote set-url origin git@github.com:${GITHUB_REPOSITORY}.git || true
+          git fetch --prune
+          # detect default branch
+          DEF=$(git remote show origin | sed -n 's/.*HEAD branch: //p'); [ -z "$DEF" ] && DEF=main
+          git checkout -B "$DEF"
+          git reset --hard "origin/$DEF"
+
+          cd backend
+          npm ci
+          npm run build
+          sudo systemctl restart explorertoken-backend
+          curl -sS http://127.0.0.1:4000/health || true
+          SSH
+
+      - name: Frontend build & publish
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" <<'SSH'
+          set -euo pipefail
+          cd ~/ExplorerToken/frontend
+          npm ci
+          npm run build
+
+          WEB_ROOT=$(
+            sudo nginx -T 2>/dev/null | awk '
+              /server_name[^\n]*haswork\.dev/ { ins=1 }
+              ins && $1=="root" { gsub(";","",$2); print $2; exit }
+              ins && /}/ { ins=0 }'
+          )
+          [ -n "$WEB_ROOT" ] || WEB_ROOT="/var/www/haswork.dev"
+          sudo rsync -av --delete dist/ "$WEB_ROOT"/
+          sudo nginx -t && sudo systemctl reload nginx
+          SSH
+
+      - name: Collect backend logs (artifact)
+        run: |
+          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "sudo journalctl -u explorertoken-backend -n 400 --no-pager" > backend_logs.txt
+          tar -czf logs.tgz backend_logs.txt
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs
+          path: logs.tgz
