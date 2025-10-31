@@ -37,7 +37,7 @@ jobs:
           done
           [ "$miss" -eq 0 ] || exit 1
 
-      - name: SSH: print worker logs inline (no artifact)
+      - name: SSH: print worker logs inline
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
