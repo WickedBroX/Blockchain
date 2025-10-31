@@ -41,16 +41,16 @@ jobs:
           done
           [ "$miss" -eq 0 ] || exit 1
 
-      - name: Deploy over SSH (NVM-safe, temp-clone + rsync, domain-agnostic publish)
+      - name: Deploy over SSH (NVM-safe, preflight sudo, temp-clone + rsync, full diagnostics)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Optional if you didn't configure NOPASSWD sudoers
+          # Optional if you don't have NOPASSWD sudoers configured
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-          # Server-fixed locations (match your current manual process)
+          # Server paths (match your manual process)
           BACKEND_DIR: /home/deploy/ExplorerToken/backend
           FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
           REPO_URL: https://github.com/WickedBroX/Blockchain.git
-          # Frontend publish directory (domain-agnostic). Default → /var/www/html
+          # FE publish directory (domain-agnostic). Blank → /var/www/html
           PUBLISH_DIR: ${{ inputs.publish_dir }}
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -63,15 +63,56 @@ jobs:
             set -euo pipefail
             BRANCH="${{ inputs.branch }}"
 
+            # ---------- helpers ----------
+            DIAG="$HOME/deploy-diag.txt"
+            : > "$DIAG"
+            log() { echo "[$(date +'%F %T')] $*" | tee -a "$DIAG"; }
+
+            diag_dump() {
+              {
+                echo "===== DEPLOY DIAGNOSTICS ====="
+                date
+                echo "User: $(whoami)"
+                echo "Host: $(hostname)"
+                echo "PWD: $(pwd)"
+                echo "PATH: $PATH"
+                echo "Node: $(command -v node || echo 'node not found')"
+                node -v || true
+                npm -v || true
+                echo
+                echo "== Backend build output =="
+                ls -la "$BACKEND_DIR/dist" || true
+                echo
+                echo "== Service unit file =="
+                systemctl cat explorertoken-backend 2>&1 || true
+                echo
+                echo "== Service status =="
+                systemctl status explorertoken-backend 2>&1 || true
+                echo
+                echo "== Journal -xeu (recent) =="
+                journalctl -xeu explorertoken-backend 2>&1 | tail -n 400 || true
+                echo
+                echo "== Journal -u (last 400 lines) =="
+                journalctl -u explorertoken-backend -n 400 --no-pager 2>&1 || true
+              } >> "$DIAG"
+              # Also keep the traditional server-logs.txt for compatibility
+              journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" 2>/dev/null || true
+            }
+
             # ---------- sudo strategy ----------
             if [ -n "${SUDO_PASSWORD:-}" ]; then
               SUDO='sudo -S -p ""'
-              echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1 || { echo "ERROR: Invalid SUDO_PASSWORD or not permitted."; exit 1; }
+              if ! echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1; then
+                log "ERROR: Invalid SUDO_PASSWORD or sudo not permitted."
+                diag_dump
+                exit 1
+              fi
               run_sudo() { echo "$SUDO_PASSWORD" | $SUDO "$@"; }
             else
               if ! sudo -n true >/dev/null 2>&1; then
-                echo "ERROR: sudo requires a password but SUDO_PASSWORD is not set."
-                echo "Provide SUDO_PASSWORD in Environment 'production' or grant NOPASSWD for deploy user."
+                log "ERROR: sudo requires a password but SUDO_PASSWORD is not set."
+                log "Fix: add SUDO_PASSWORD in Environment 'production' or grant NOPASSWD for deploy."
+                diag_dump
                 exit 1
               fi
               SUDO='sudo -n'
@@ -85,57 +126,87 @@ jobs:
             export NVM_DIR="$HOME/.nvm"
             if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh"; fi
             if ! command -v node >/dev/null 2>&1; then
-              echo "Node not found; installing Node 22 via NVM..."
-              [ -s "$NVM_DIR/nvm.sh" ] || { echo "ERROR: NVM not found at $NVM_DIR"; exit 1; }
+              log "Node not found; installing Node 22 via NVM..."
+              if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+                log "ERROR: NVM not found at $NVM_DIR"
+                diag_dump
+                exit 1
+              fi
               nvm install 22
             fi
             nvm use 22 >/dev/null 2>&1 || true
-            node -v
-            npm -v
+            log "Node: $(node -v), npm: $(npm -v)"
 
             # ---------- fresh shallow clone then mirror ----------
             TMPDIR="$(mktemp -d)"
+            log "Cloning $REPO_URL branch $BRANCH to $TMPDIR/repo"
             git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/repo"
 
-            # backend -> mirror
+            log "Sync backend sources → $BACKEND_DIR"
             rsync -a --delete --exclude ".git" "$TMPDIR/repo/backend/" "$BACKEND_DIR/"
 
-            # backend build
+            log "Build backend"
             cd "$BACKEND_DIR"
             npm ci
             npm run build
 
-            # restart backend + verify health
-            run_sudo /usr/bin/systemctl restart explorertoken-backend
-            sleep 2
-            curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
+            log "Daemon-reload"
+            run_sudo /usr/bin/systemctl daemon-reload
 
-            # frontend -> mirror & build
+            log "Restart backend"
+            if ! run_sudo /usr/bin/systemctl restart explorertoken-backend; then
+              log "ERROR: systemctl restart failed"
+              diag_dump
+              exit 1
+            fi
+
+            log "Health check"
+            if ! curl -fsS http://127.0.0.1:4000/health >/dev/null; then
+              log "ERROR: /health did not return 200"
+              diag_dump
+              exit 1
+            fi
+
+            log "Sync frontend sources → $FRONTEND_DIR"
             rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
+
+            log "Build frontend"
             cd "$FRONTEND_DIR"
             npm ci
             npm run build
 
             # ---------- publish frontend (domain-agnostic) ----------
-            # If not provided, default to /var/www/html
             if [ -z "${PUBLISH_DIR:-}" ]; then
               PUBLISH_DIR="/var/www/html"
             fi
-            echo "Publishing frontend dist → ${PUBLISH_DIR}"
+            log "Publish dist → $PUBLISH_DIR"
             run_sudo mkdir -p "$PUBLISH_DIR"
             run_sudo /usr/bin/rsync -a --delete dist/ "$PUBLISH_DIR"/
 
-            # If nginx exists, test and reload (do nothing if absent)
+            # ---------- nginx sanity (no-op if absent) ----------
             if command -v nginx >/dev/null 2>&1; then
               if run_sudo /usr/sbin/nginx -t; then
                 run_sudo /usr/bin/systemctl reload nginx || true
               fi
             fi
 
-            # Save backend logs for artifact pickup (optional)
-            journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
+            # Final logs for artifact (even on success)
+            diag_dump
+            log "Deploy completed"
 
-      - name: Pull back server logs (artifact)
+      - name: Pull back deploy diagnostics
+        if: always()
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: 22
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "deploy-diag.txt"
+          target: "./"
+
+      - name: Pull back server journal (compat)
+        if: always()
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -145,8 +216,11 @@ jobs:
           source: "server-logs.txt"
           target: "./"
 
-      - name: Upload backend logs artifact
+      - name: Upload artifacts (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: server-logs
-          path: server-logs.txt
+          name: deploy-diagnostics
+          path: |
+            deploy-diag.txt
+            server-logs.txt
