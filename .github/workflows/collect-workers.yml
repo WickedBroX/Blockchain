@@ -37,7 +37,7 @@ jobs:
           done
           [ "$miss" -eq 0 ] || exit 1
 
-      - name: SSH: dump worker logs to files
+      - name: SSH: print worker logs inline (no artifact)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -48,37 +48,16 @@ jobs:
           script: |
             set -euo pipefail
             LINES="${{ inputs.lines }}"
-            OUTDIR="$HOME/worker-logs"
-            rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
+            echo "===== Worker Units ====="
+            systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager || true
 
             if systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager | awk '{print $1}' | grep -q .; then
               systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager \
                 | awk '{print $1}' | sed 's/.service$//' \
                 | while read -r unit; do
-                    echo "Collecting $unit ..."
-                    journalctl -u "$unit" -n "$LINES" --no-pager > "$OUTDIR/${unit}.log" || true
+                    echo "===== $unit (last $LINES lines) ====="
+                    journalctl -u "$unit" -n "$LINES" --no-pager || true
                   done
             else
-              echo "No worker services found; writing placeholder."
-              echo "No worker units present" > "$OUTDIR/NO_WORKERS.txt"
+              echo "No worker services found."
             fi
-
-            ls -la "$OUTDIR"
-
-      - name: SCP: retrieve logs
-        if: always()
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: 22
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "worker-logs/*"
-          target: "./"
-
-      - name: Upload logs artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: worker-logs
-          path: worker-logs
