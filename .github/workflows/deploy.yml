@@ -18,69 +18,40 @@ jobs:
     environment: ${{ inputs.env }}
     steps:
       - name: Assert environment bindings (presence only)
-  shell: bash
-  env:
-    # REQUIRED
-    SSH_HOST: ${{ secrets.SSH_HOST }}
-    SSH_USER: ${{ secrets.SSH_USER }}
-    SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        shell: bash
+        env:
+          # REQUIRED
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          # OPTIONAL
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          WEB_ROOT: ${{ vars.WEB_ROOT }}
+        run: |
+          set +u
+          missing_required=0
+          check_required () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=REQUIRED:$k::SET" || { echo "::error title=REQUIRED:$k::MISSING"; missing_required=1; }; }
+          check_optional () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=OPTIONAL:$k::SET" || echo "::notice title=OPTIONAL:$k::MISSING (ok)"; }
 
-    # OPTIONAL
-    SSH_PORT: ${{ secrets.SSH_PORT }}
-    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-    WEB_ROOT: ${{ vars.WEB_ROOT }}
-  run: |
-    set +u  # don't crash on unset while checking
+          echo "Asserting Environment: ${{ inputs.env }}"
+          check_required SSH_HOST
+          check_required SSH_USER
+          check_required SSH_PRIVATE_KEY
+          check_optional SSH_PORT
+          check_optional SUDO_PASSWORD
+          check_optional WEB_ROOT
 
-    missing_required=0
-
-    check_required () {
-      local k="$1"
-      local v="${!k-}"
-      if [ -n "$v" ]; then
-        echo "::notice title=REQUIRED:$k::SET"
-      else
-        echo "::error title=REQUIRED:$k::MISSING"
-        missing_required=1
-      fi
-    }
-
-    check_optional () {
-      local k="$1"
-      local v="${!k-}"
-      if [ -n "$v" ]; then
-        echo "::notice title=OPTIONAL:$k::SET"
-      else
-        echo "::notice title=OPTIONAL:$k::MISSING (will not fail the job)"
-      fi
-    }
-
-    echo "Asserting Environment: ${{ inputs.env }}"
-    # Required
-    check_required SSH_HOST
-    check_required SSH_USER
-    check_required SSH_PRIVATE_KEY
-
-    # Optional (informational only)
-    check_optional SSH_PORT
-    check_optional SUDO_PASSWORD
-    check_optional WEB_ROOT
-
-    if [ "$missing_required" -ne 0 ]; then
-      echo "One or more REQUIRED secrets are missing. Add them in Settings → Environments → ${{ inputs.env }}."
-      exit 1
-    fi
-
+          [ "$missing_required" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
 
       - name: Deploy over SSH (build on VPS, NVM-safe)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Optional: supply only if you didn't configure NOPASSWD sudoers
+          # Optional (only if you didn't configure NOPASSWD sudoers)
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
           # Optional: environment var for web root
           WEB_ROOT: ${{ vars.WEB_ROOT }}
-
-          # IMPORTANT: forward these to remote shell
+          # IMPORTANT: forward these to the remote shell
           BACKEND_DIR: /home/deploy/ExplorerToken/backend
           FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
           REPO_URL: https://github.com/WickedBroX/Blockchain.git
