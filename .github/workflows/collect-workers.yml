@@ -18,19 +18,55 @@ jobs:
     environment: ${{ inputs.env }}
     steps:
       - name: Assert environment bindings (presence only)
-        shell: bash
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-        run: |
-          check() { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=$k::SET" || { echo "::error title=$k::MISSING"; MISSING=1; }; }
-          MISSING=0
-          echo "Asserting Environment: ${{ inputs.env }}"
-          check SSH_HOST; check SSH_USER; check SSH_PRIVATE_KEY
-          echo "Optional:"; check SSH_PORT
-          [ "$MISSING" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
+  shell: bash
+  env:
+    # REQUIRED
+    SSH_HOST: ${{ secrets.SSH_HOST }}
+    SSH_USER: ${{ secrets.SSH_USER }}
+    SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    # OPTIONAL
+    SSH_PORT: ${{ secrets.SSH_PORT }}
+  run: |
+    set +u
+
+    missing_required=0
+
+    check_required () {
+      local k="$1"
+      local v="${!k-}"
+      if [ -n "$v" ]; then
+        echo "::notice title=REQUIRED:$k::SET"
+      else
+        echo "::error title=REQUIRED:$k::MISSING"
+        missing_required=1
+      fi
+    }
+
+    check_optional () {
+      local k="$1"
+      local v="${!k-}"
+      if [ -n "$v" ]; then
+        echo "::notice title=OPTIONAL:$k::SET"
+      else
+        echo "::notice title=OPTIONAL:$k::MISSING (will not fail the job)"
+      fi
+    }
+
+    echo "Asserting Environment: ${{ inputs.env }}"
+    # Required
+    check_required SSH_HOST
+    check_required SSH_USER
+    check_required SSH_PRIVATE_KEY
+
+    # Optional
+    check_optional SSH_PORT
+
+    if [ "$missing_required" -ne 0 ]; then
+      echo "One or more REQUIRED secrets are missing. Add them in Settings → Environments → ${{ inputs.env }}."
+      exit 1
+    fi
+
 
       - name: SSH: dump worker logs to files
         uses: appleboy/ssh-action@v1.0.3
