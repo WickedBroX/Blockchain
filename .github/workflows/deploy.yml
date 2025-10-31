@@ -1,183 +1,135 @@
-name: Deploy to VPS
+- name: Deploy over SSH (NVM-safe, temp-clone + rsync, env + override, anti-hijack)
+  uses: appleboy/ssh-action@v1.0.3
+  env:
+    # Optional if NOPASSWD isn't configured
+    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
 
-on:
-  workflow_dispatch:
-    inputs:
-      env:
-        description: "GitHub Environment"
-        required: true
-        default: production
-      branch:
-        description: "Branch to deploy"
-        required: true
-        default: main
-      publish_dir:
-        description: "Frontend publish directory on server (default: /var/www/html)"
-        required: false
-        default: ""
+    # Repo & server paths
+    REPO_URL: https://github.com/WickedBroX/Blockchain.git
+    BACKEND_DIR: /home/deploy/ExplorerToken/backend
+    FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
+    PUBLISH_DIR: ${{ inputs.publish_dir }}
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.env }}
-    steps:
-      - name: Assert required SSH secrets
-        shell: bash
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        run: |
-          set +u
-          miss=0
-          for k in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
-            v="${!k-}"; if [ -z "$v" ]; then echo "::error title=REQUIRED:$k::MISSING"; miss=1; else echo "::notice title=REQUIRED:$k::SET"; fi
-          done
-          [ "$miss" -eq 0 ] || exit 1
+    # Backend runtime secrets (set these in Environment: production)
+    BACKEND_ADMIN_EMAIL:    ${{ secrets.BACKEND_ADMIN_EMAIL }}
+    BACKEND_ADMIN_PASSWORD: ${{ secrets.BACKEND_ADMIN_PASSWORD }}
+    BACKEND_JWT_SECRET:     ${{ secrets.BACKEND_JWT_SECRET }}
+    BACKEND_DATABASE_URL:   ${{ secrets.BACKEND_DATABASE_URL }}
+    BACKEND_REDIS_URL:      ${{ secrets.BACKEND_REDIS_URL }}
+    BACKEND_PORT:           ${{ secrets.BACKEND_PORT }}
 
-      - name: Deploy over SSH (env file + override, NVM-safe, temp-clone + rsync)
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          # Optional if NOPASSWD isn't configured
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+    # Node & entrypoint you confirmed
+    NODE_BIN:   /home/deploy/.nvm/versions/node/v22.21.0/bin/node
+    ENTRYPOINT: dist/src/index.js
+  with:
+    host: ${{ secrets.SSH_HOST }}
+    username: ${{ secrets.SSH_USER }}
+    port: 22
+    key: ${{ secrets.SSH_PRIVATE_KEY }}
+    command_timeout: 45m
+    envs: SUDO_PASSWORD,REPO_URL,BACKEND_DIR,FRONTEND_DIR,PUBLISH_DIR,NODE_BIN,ENTRYPOINT,BACKEND_ADMIN_EMAIL,BACKEND_ADMIN_PASSWORD,BACKEND_JWT_SECRET,BACKEND_DATABASE_URL,BACKEND_REDIS_URL,BACKEND_PORT
+    script: |
+      set -euo pipefail
+      BRANCH="${{ inputs.branch }}"
 
-          # Repo & server paths
-          REPO_URL: https://github.com/WickedBroX/Blockchain.git
-          BACKEND_DIR: /home/deploy/ExplorerToken/backend
-          FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
-          PUBLISH_DIR: ${{ inputs.publish_dir }}
+      # --- sudo helper ---
+      if [ -n "${SUDO_PASSWORD:-}" ]; then
+        SUDO='sudo -S -p ""'
+        echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1
+        run_sudo() { echo "$SUDO_PASSWORD" | $SUDO "$@"; }
+      else
+        sudo -n true >/dev/null 2>&1
+        SUDO='sudo -n'
+        run_sudo() { $SUDO "$@"; }
+      fi
 
-          # Backend runtime secrets (set these in Environment: production)
-          BACKEND_ADMIN_EMAIL:    ${{ secrets.BACKEND_ADMIN_EMAIL }}
-          BACKEND_ADMIN_PASSWORD: ${{ secrets.BACKEND_ADMIN_PASSWORD }}
-          BACKEND_JWT_SECRET:     ${{ secrets.BACKEND_JWT_SECRET }}
-          BACKEND_DATABASE_URL:   ${{ secrets.BACKEND_DATABASE_URL }}
-          BACKEND_REDIS_URL:      ${{ secrets.BACKEND_REDIS_URL }}
-          BACKEND_PORT:           ${{ secrets.BACKEND_PORT }}
+      # --- ensure dirs ---
+      mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-          # Node & entrypoint (from your confirmation)
-          NODE_BIN:   /home/deploy/.nvm/versions/node/v22.21.0/bin/node
-          ENTRYPOINT: dist/src/index.js
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: 22
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 45m
-          envs: SUDO_PASSWORD,REPO_URL,BACKEND_DIR,FRONTEND_DIR,PUBLISH_DIR,NODE_BIN,ENTRYPOINT,BACKEND_ADMIN_EMAIL,BACKEND_ADMIN_PASSWORD,BACKEND_JWT_SECRET,BACKEND_DATABASE_URL,BACKEND_REDIS_URL,BACKEND_PORT
-          script: |
-            set -euo pipefail
-            BRANCH="${{ inputs.branch }}"
+      # --- NVM bootstrap ---
+      export NVM_DIR="$HOME/.nvm"
+      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" || true
+      if ! command -v node >/dev/null 2>&1; then
+        [ -s "$NVM_DIR/nvm.sh" ] || { echo "NVM missing"; exit 1; }
+        nvm install 22
+      fi
+      nvm use 22 >/dev/null 2>&1 || true
+      node -v; npm -v
 
-            # ---- helpers ----
-            log() { echo "[$(date +'%F %T')] $*"; }
-            diag_dump() {
-              echo "===== DIAGNOSTICS ====="
-              systemctl cat explorertoken-backend 2>&1 || true
-              systemctl status explorertoken-backend 2>&1 || true
-              journalctl -u explorertoken-backend -n 200 --no-pager 2>&1 || true
-              echo "===== END DIAGNOSTICS ====="
-            }
+      # --- fresh clone → mirror ---
+      TMPDIR="$(mktemp -d)"
+      git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/repo"
 
-            # ---- sudo ----
-            if [ -n "${SUDO_PASSWORD:-}" ]; then
-              SUDO='sudo -S -p ""'
-              echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1 || { echo "ERROR: bad SUDO_PASSWORD or not permitted"; diag_dump; exit 1; }
-              run_sudo() { echo "$SUDO_PASSWORD" | $SUDO "$@"; }
-            else
-              if ! sudo -n true >/dev/null 2>&1; then
-                echo "ERROR: sudo needs password but SUDO_PASSWORD not set"; diag_dump; exit 1
-              fi
-              SUDO='sudo -n'
-              run_sudo() { $SUDO "$@"; }
-            fi
+      # Backend sync + build
+      rsync -a --delete --exclude ".git" "$TMPDIR/repo/backend/" "$BACKEND_DIR/"
+      cd "$BACKEND_DIR"
+      npm ci
+      npm run build
 
-            # ---- ensure dirs ----
-            mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
+      # >>> CRITICAL: remove root-level node_modules so it cannot hijack resolution <<<
+      rm -rf /home/deploy/ExplorerToken/node_modules
 
-            # ---- NVM Node ----
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" || true
-            if ! command -v node >/dev/null 2>&1; then
-              echo "Node not found; installing Node 22..."
-              [ -s "$NVM_DIR/nvm.sh" ] || { echo "ERROR: NVM not found at $NVM_DIR"; exit 1; }
-              nvm install 22
-            fi
-            nvm use 22 >/dev/null 2>&1 || true
-            log "Node: $(node -v), npm: $(npm -v)"
+      # Write/refresh runtime env file
+      run_sudo mkdir -p /etc/explorertoken
+      run_sudo bash -lc 'umask 0177; {
+        echo "NODE_ENV=production";
+        echo "PORT=${BACKEND_PORT:-4000}";
+        [ -n "${BACKEND_ADMIN_EMAIL:-}" ]    && echo "ADMIN_EMAIL=${BACKEND_ADMIN_EMAIL}";
+        [ -n "${BACKEND_ADMIN_PASSWORD:-}" ] && echo "ADMIN_PASSWORD=${BACKEND_ADMIN_PASSWORD}";
+        [ -n "${BACKEND_JWT_SECRET:-}" ]     && echo "JWT_SECRET=${BACKEND_JWT_SECRET}";
+        [ -n "${BACKEND_DATABASE_URL:-}" ]   && echo "DATABASE_URL=${BACKEND_DATABASE_URL}";
+        [ -n "${BACKEND_REDIS_URL:-}" ]      && echo "REDIS_URL=${BACKEND_REDIS_URL}";
+      } > /etc/explorertoken/backend.env'
 
-            # ---- temp clone then mirror ----
-            TMPDIR="$(mktemp -d)"
-            log "Cloning $REPO_URL ($BRANCH) → $TMPDIR/repo"
-            git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/repo"
+      # Guard: require ADMIN_EMAIL + JWT_SECRET to avoid runtime crash
+      [ -n "${BACKEND_ADMIN_EMAIL:-}" ] || { echo "BACKEND_ADMIN_EMAIL missing"; exit 1; }
+      [ -n "${BACKEND_JWT_SECRET:-}" ]  || { echo "BACKEND_JWT_SECRET missing"; exit 1; }
 
-            # backend sync + build
-            rsync -a --delete --exclude ".git" "$TMPDIR/repo/backend/" "$BACKEND_DIR/"
-            cd "$BACKEND_DIR"
-            npm ci
-            npm run build
-
-            # ---- write env file safely ----
-            run_sudo mkdir -p /etc/explorertoken
-            run_sudo bash -lc 'umask 0177; {
-              echo "NODE_ENV=production";
-              echo "PORT=${BACKEND_PORT:-4000}";
-              [ -n "${BACKEND_ADMIN_EMAIL:-}" ]    && echo "ADMIN_EMAIL=${BACKEND_ADMIN_EMAIL}";
-              [ -n "${BACKEND_ADMIN_PASSWORD:-}" ] && echo "ADMIN_PASSWORD=${BACKEND_ADMIN_PASSWORD}";
-              [ -n "${BACKEND_JWT_SECRET:-}" ]     && echo "JWT_SECRET=${BACKEND_JWT_SECRET}";
-              [ -n "${BACKEND_DATABASE_URL:-}" ]   && echo "DATABASE_URL=${BACKEND_DATABASE_URL}";
-              [ -n "${BACKEND_REDIS_URL:-}" ]      && echo "REDIS_URL=${BACKEND_REDIS_URL}";
-            } > /etc/explorertoken/backend.env'
-
-            # Ensure ADMIN_EMAIL exists
-            if [ -z "${BACKEND_ADMIN_EMAIL:-}" ]; then
-              echo "ERROR: BACKEND_ADMIN_EMAIL secret is required (sets ADMIN_EMAIL for the web server)"; exit 1
-            fi
-            if [ -z "${BACKEND_JWT_SECRET:-}" ]; then
-              echo "ERROR: BACKEND_JWT_SECRET secret is required"; exit 1
-            fi
-
-            # ---- systemd override (NVM Node + env file) ----
-            OV_DIR="/etc/systemd/system/explorertoken-backend.service.d"
-            run_sudo mkdir -p "$OV_DIR"
-            run_sudo bash -lc "cat > '$OV_DIR/override.conf' <<OVR
+      # Systemd override with PATH + NODE_PATH pinned to backend
+      OV_DIR="/etc/systemd/system/explorertoken-backend.service.d"
+      run_sudo mkdir -p "$OV_DIR"
+      run_sudo bash -lc "cat > '$OV_DIR/override.conf' <<OVR
 [Service]
 User=deploy
 WorkingDirectory=$BACKEND_DIR
 EnvironmentFile=-/etc/explorertoken/backend.env
 Environment=PATH=$(dirname "$NODE_BIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_PATH=$BACKEND_DIR/node_modules
 ExecStart=
 ExecStart=$NODE_BIN $ENTRYPOINT
 Restart=always
 RestartSec=3
 OVR"
 
-            # ---- reload + restart + health ----
-            run_sudo /usr/bin/systemctl daemon-reload
-            if ! run_sudo /usr/bin/systemctl restart explorertoken-backend; then
-              echo "ERROR: restart failed"; diag_dump; exit 1
-            fi
+      # Reload + restart + health
+      run_sudo /usr/bin/systemctl daemon-reload
+      run_sudo /usr/bin/systemctl restart explorertoken-backend || { 
+        echo "Restart failed"; 
+        systemctl status explorertoken-backend 2>&1 || true; 
+        journalctl -u explorertoken-backend -n 200 --no-pager || true; 
+        exit 1; 
+      }
 
-            if ! curl -fsS http://127.0.0.1:4000/health >/dev/null; then
-              echo "ERROR: /health not OK"; diag_dump; exit 1
-            fi
+      curl -fsS http://127.0.0.1:4000/health >/dev/null || {
+        echo "/health failed";
+        systemctl status explorertoken-backend 2>&1 || true;
+        journalctl -u explorertoken-backend -n 200 --no-pager || true;
+        exit 1;
+      }
 
-            # frontend sync + build
-            rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
-            cd "$FRONTEND_DIR"
-            npm ci
-            npm run build
+      # Frontend sync + build + publish
+      rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
+      cd "$FRONTEND_DIR"
+      npm ci
+      npm run build
 
-            # publish dist → publish_dir (or /var/www/html)
-            [ -n "${PUBLISH_DIR:-}" ] || PUBLISH_DIR="/var/www/html"
-            run_sudo mkdir -p "$PUBLISH_DIR"
-            run_sudo /usr/bin/rsync -a --delete dist/ "$PUBLISH_DIR"/
+      [ -n "${PUBLISH_DIR:-}" ] || PUBLISH_DIR="/var/www/html"
+      run_sudo mkdir -p "$PUBLISH_DIR"
+      run_sudo /usr/bin/rsync -a --delete dist/ "$PUBLISH_DIR"/
 
-            # nginx sanity if present
-            if command -v nginx >/dev/null 2>&1; then
-              if run_sudo /usr/sbin/nginx -t; then
-                run_sudo /usr/bin/systemctl reload nginx || true
-              fi
-            fi
+      # Nginx sanity if present
+      if command -v nginx >/dev/null 2>&1; then
+        run_sudo /usr/sbin/nginx -t && run_sudo /usr/bin/systemctl reload nginx || true
+      fi
 
-            echo "Deploy completed"
+      echo "Deploy completed"
