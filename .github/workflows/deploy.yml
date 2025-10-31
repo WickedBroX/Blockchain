@@ -25,7 +25,6 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           # OPTIONAL
-          SSH_PORT: ${{ secrets.SSH_PORT }}
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
           WEB_ROOT: ${{ vars.WEB_ROOT }}
         run: |
@@ -38,103 +37,102 @@ jobs:
           check_required SSH_HOST
           check_required SSH_USER
           check_required SSH_PRIVATE_KEY
-          check_optional SSH_PORT
           check_optional SUDO_PASSWORD
           check_optional WEB_ROOT
 
           [ "$missing_required" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
 
-     - name: Deploy over SSH (build on VPS, NVM-safe, temp-clone + rsync)
-  uses: appleboy/ssh-action@v1.0.3
-  env:
-    # Optional (only if you didn't configure NOPASSWD sudoers)
-    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-    # Optional web root env var
-    WEB_ROOT: ${{ vars.WEB_ROOT }}
+      - name: Deploy over SSH (NVM-safe, temp-clone + rsync)
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Optional (only if you didn't configure NOPASSWD sudoers)
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          # Optional: environment var for web root
+          WEB_ROOT: ${{ vars.WEB_ROOT }}
+          # Forwarded constants for remote
+          BACKEND_DIR: /home/deploy/ExplorerToken/backend
+          FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
+          REPO_URL: https://github.com/WickedBroX/Blockchain.git
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: 22
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,REPO_URL
+          script: |
+            set -euo pipefail
 
-    # Forwarded constants for remote
-    BACKEND_DIR: /home/deploy/ExplorerToken/backend
-    FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
-    REPO_URL: https://github.com/WickedBroX/Blockchain.git
-  with:
-    host: ${{ secrets.SSH_HOST }}
-    username: ${{ secrets.SSH_USER }}
-    port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
-    key: ${{ secrets.SSH_PRIVATE_KEY }}
-    command_timeout: 30m
-    envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,REPO_URL
-    script: |
-      set -euo pipefail
+            BRANCH="${{ inputs.branch }}"
 
-      BRANCH="${{ inputs.branch }}"
+            # sudo strategy
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              SUDO='echo "$SUDO_PASSWORD" | sudo -S'
+            else
+              SUDO='sudo'
+            fi
 
-      # sudo strategy
-      if [ -n "${SUDO_PASSWORD:-}" ]; then
-        SUDO='echo "$SUDO_PASSWORD" | sudo -S'
-      else
-        SUDO='sudo'
-      fi
+            # Ensure dirs
+            mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-      mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
+            # --- NVM bootstrap ---
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+            node -v
+            npm -v
 
-      # --- NVM bootstrap ---
-      export NVM_DIR="$HOME/.nvm"
-      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-      export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
-      node -v
-      npm -v
+            # --- Fresh shallow clone to temp, then mirror with rsync ---
+            TMPDIR="$(mktemp -d)"
+            git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/repo"
 
-      # --- Fresh shallow clone to temp, then mirror with rsync ---
-      TMPDIR="$(mktemp -d)"
-      git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/repo"
+            # Sync backend sources (no .git)
+            rsync -a --delete --exclude ".git" "$TMPDIR/repo/backend/" "$BACKEND_DIR/"
 
-      # Sync backend sources (no .git)
-      rsync -a --delete --exclude ".git" "$TMPDIR/repo/backend/" "$BACKEND_DIR/"
+            # Build backend
+            cd "$BACKEND_DIR"
+            npm ci
+            npm run build
 
-      # Build backend
-      cd "$BACKEND_DIR"
-      npm ci
-      npm run build
+            # Restart backend and verify
+            $SUDO /usr/bin/systemctl restart explorertoken-backend
+            sleep 2
+            curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
 
-      # Restart backend and verify
-      $SUDO /usr/bin/systemctl restart explorertoken-backend
-      sleep 2
-      curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
+            # Sync frontend sources (no .git)
+            rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
 
-      # Sync frontend sources (no .git)
-      rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
+            # Build frontend
+            cd "$FRONTEND_DIR"
+            npm ci
+            npm run build
 
-      # Build frontend
-      cd "$FRONTEND_DIR"
-      npm ci
-      npm run build
+            # Determine WEB_ROOT if not provided
+            if [ -z "${WEB_ROOT:-}" ]; then
+              CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
+              if [ -n "$CAND" ]; then
+                WEB_ROOT=$(awk '/\\sroot\\s/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+              fi
+              WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
+            fi
+            echo "WEB_ROOT => $WEB_ROOT"
 
-      # Determine WEB_ROOT if not provided
-      if [ -z "${WEB_ROOT:-}" ]; then
-        CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
-        if [ -n "$CAND" ]; then
-          WEB_ROOT=$(awk '/\\sroot\\s/{print $2}' "$CAND" | tr -d ';' | tail -n1)
-        fi
-        WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
-      fi
-      echo "WEB_ROOT => $WEB_ROOT"
+            # Publish frontend dist
+            $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
 
-      # Publish frontend dist
-      $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
+            # Nginx sanity
+            $SUDO /usr/sbin/nginx -t
+            $SUDO /usr/bin/systemctl reload nginx
 
-      # Nginx sanity
-      $SUDO /usr/sbin/nginx -t
-      $SUDO /usr/bin/systemctl reload nginx
-
-      # Save logs for artifact
-      journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
+            # Save logs for artifact
+            journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
 
       - name: Pull back server logs (artifact)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          port: 22
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "server-logs.txt"
           target: "./"
