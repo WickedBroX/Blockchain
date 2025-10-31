@@ -11,144 +11,128 @@ on:
         description: "Branch to deploy"
         required: true
         default: main
+      publish_dir:
+        description: "Frontend publish directory on server (default: /var/www/html)"
+        required: false
+        default: ""
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ inputs.env }}
     steps:
-      - name: Assert environment bindings (presence only)
+      - name: Assert required secrets (presence only)
         shell: bash
         env:
-          # REQUIRED
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          # OPTIONAL
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-          WEB_ROOT: ${{ vars.WEB_ROOT }}
         run: |
           set +u
-          missing_required=0
-          check_required () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=REQUIRED:$k::SET" || { echo "::error title=REQUIRED:$k::MISSING"; missing_required=1; }; }
-          check_optional () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=OPTIONAL:$k::SET" || echo "::notice title=OPTIONAL:$k::MISSING (ok)"; }
+          miss=0
+          for k in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
+            v="${!k-}"
+            if [ -z "$v" ]; then
+              echo "::error title=REQUIRED:$k::MISSING"
+              miss=1
+            else
+              echo "::notice title=REQUIRED:$k::SET"
+            fi
+          done
+          [ "$miss" -eq 0 ] || exit 1
 
-          echo "Asserting Environment: ${{ inputs.env }}"
-          check_required SSH_HOST
-          check_required SSH_USER
-          check_required SSH_PRIVATE_KEY
-          check_optional SUDO_PASSWORD
-          check_optional WEB_ROOT
-
-          [ "$missing_required" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
-
-      - name: Deploy over SSH (NVM-safe, preflight sudo, temp-clone + rsync)
+      - name: Deploy over SSH (NVM-safe, temp-clone + rsync, domain-agnostic publish)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Optional (only if you didn't configure NOPASSWD sudoers)
+          # Optional if you didn't configure NOPASSWD sudoers
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-          # Optional: environment var for web root
-          WEB_ROOT: ${{ vars.WEB_ROOT }}
-          # Forwarded constants for remote
+          # Server-fixed locations (match your current manual process)
           BACKEND_DIR: /home/deploy/ExplorerToken/backend
           FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
           REPO_URL: https://github.com/WickedBroX/Blockchain.git
+          # Frontend publish directory (domain-agnostic). Default → /var/www/html
+          PUBLISH_DIR: ${{ inputs.publish_dir }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           port: 22
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 45m
-          envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,REPO_URL
+          envs: SUDO_PASSWORD,BACKEND_DIR,FRONTEND_DIR,REPO_URL,PUBLISH_DIR
           script: |
             set -euo pipefail
-
             BRANCH="${{ inputs.branch }}"
 
-            # --- Preflight: sudo mode ---
+            # ---------- sudo strategy ----------
             if [ -n "${SUDO_PASSWORD:-}" ]; then
               SUDO='sudo -S -p ""'
-              # quick probe with password
-              echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1 || { echo "ERROR: Provided SUDO_PASSWORD is incorrect or sudo not permitted."; exit 1; }
+              echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1 || { echo "ERROR: Invalid SUDO_PASSWORD or not permitted."; exit 1; }
+              run_sudo() { echo "$SUDO_PASSWORD" | $SUDO "$@"; }
             else
-              # require NOPASSWD
               if ! sudo -n true >/dev/null 2>&1; then
-                echo "ERROR: sudo requires a password but no SUDO_PASSWORD secret was provided."
-                echo "Fix: add SUDO_PASSWORD to Environment 'production' secrets OR configure NOPASSWD in sudoers for deploy user."
+                echo "ERROR: sudo requires a password but SUDO_PASSWORD is not set."
+                echo "Provide SUDO_PASSWORD in Environment 'production' or grant NOPASSWD for deploy user."
                 exit 1
               fi
               SUDO='sudo -n'
+              run_sudo() { $SUDO "$@"; }
             fi
 
-            # --- Ensure dirs ---
+            # ---------- ensure dirs ----------
             mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-            # --- NVM bootstrap (install if missing) ---
+            # ---------- NVM bootstrap (install Node if missing) ----------
             export NVM_DIR="$HOME/.nvm"
-            if [ -s "$NVM_DIR/nvm.sh" ]; then
-              . "$NVM_DIR/nvm.sh"
-            fi
+            if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh"; fi
             if ! command -v node >/dev/null 2>&1; then
               echo "Node not found; installing Node 22 via NVM..."
               [ -s "$NVM_DIR/nvm.sh" ] || { echo "ERROR: NVM not found at $NVM_DIR"; exit 1; }
               nvm install 22
             fi
             nvm use 22 >/dev/null 2>&1 || true
-            export PATH="$HOME/.nvm/versions/node/$(node -v | tr -d v)/bin:$PATH"
             node -v
             npm -v
 
-            # --- Fresh shallow clone to temp, then mirror with rsync ---
+            # ---------- fresh shallow clone then mirror ----------
             TMPDIR="$(mktemp -d)"
             git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/repo"
 
-            # Sync backend sources (no .git)
+            # backend -> mirror
             rsync -a --delete --exclude ".git" "$TMPDIR/repo/backend/" "$BACKEND_DIR/"
 
-            # Build backend
+            # backend build
             cd "$BACKEND_DIR"
             npm ci
             npm run build
 
-            # Restart backend and verify
-            if [ -n "${SUDO_PASSWORD:-}" ]; then
-              echo "$SUDO_PASSWORD" | $SUDO /usr/bin/systemctl restart explorertoken-backend
-            else
-              $SUDO /usr/bin/systemctl restart explorertoken-backend
-            fi
+            # restart backend + verify health
+            run_sudo /usr/bin/systemctl restart explorertoken-backend
             sleep 2
             curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
 
-            # Sync frontend sources (no .git)
+            # frontend -> mirror & build
             rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
-
-            # Build frontend
             cd "$FRONTEND_DIR"
             npm ci
             npm run build
 
-            # Determine WEB_ROOT if not provided
-            if [ -z "${WEB_ROOT:-}" ]; then
-              CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
-              if [ -n "$CAND" ]; then
-                WEB_ROOT=$(awk '/\\sroot\\s/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+            # ---------- publish frontend (domain-agnostic) ----------
+            # If not provided, default to /var/www/html
+            if [ -z "${PUBLISH_DIR:-}" ]; then
+              PUBLISH_DIR="/var/www/html"
+            fi
+            echo "Publishing frontend dist → ${PUBLISH_DIR}"
+            run_sudo mkdir -p "$PUBLISH_DIR"
+            run_sudo /usr/bin/rsync -a --delete dist/ "$PUBLISH_DIR"/
+
+            # If nginx exists, test and reload (do nothing if absent)
+            if command -v nginx >/dev/null 2>&1; then
+              if run_sudo /usr/sbin/nginx -t; then
+                run_sudo /usr/bin/systemctl reload nginx || true
               fi
-              WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
-            fi
-            echo "WEB_ROOT => $WEB_ROOT"
-
-            # Publish frontend dist
-            if [ -n "${SUDO_PASSWORD:-}" ]; then
-              echo "$SUDO_PASSWORD" | $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
-              echo "$SUDO_PASSWORD" | $SUDO /usr/sbin/nginx -t
-              echo "$SUDO_PASSWORD" | $SUDO /usr/bin/systemctl reload nginx
-            else
-              $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
-              $SUDO /usr/sbin/nginx -t
-              $SUDO /usr/bin/systemctl reload nginx
             fi
 
-            # Save logs for artifact
+            # Save backend logs for artifact pickup (optional)
             journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
 
       - name: Pull back server logs (artifact)
