@@ -24,19 +24,15 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          # OPTIONAL
-          SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           set +u
           missing_required=0
           check_required () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=REQUIRED:$k::SET" || { echo "::error title=REQUIRED:$k::MISSING"; missing_required=1; }; }
-          check_optional () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=OPTIONAL:$k::SET" || echo "::notice title=OPTIONAL:$k::MISSING (ok)"; }
 
           echo "Asserting Environment: ${{ inputs.env }}"
           check_required SSH_HOST
           check_required SSH_USER
           check_required SSH_PRIVATE_KEY
-          check_optional SSH_PORT
 
           [ "$missing_required" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
 
@@ -45,7 +41,7 @@ jobs:
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          port: 22
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 15m
           script: |
@@ -54,12 +50,17 @@ jobs:
             OUTDIR="$HOME/worker-logs"
             rm -rf "$OUTDIR" && mkdir -p "$OUTDIR"
 
-            systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager \
-              | awk '{print $1}' | sed 's/.service$//' \
-              | while read -r unit; do
-                  echo "Collecting $unit ..."
-                  journalctl -u "$unit" -n "$LINES" --no-pager > "$OUTDIR/${unit}.log" || true
-                done
+            if systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager | awk '{print $1}' | grep -q .; then
+              systemctl list-units 'explorertoken-chain@*.service' --no-legend --no-pager \
+                | awk '{print $1}' | sed 's/.service$//' \
+                | while read -r unit; do
+                    echo "Collecting $unit ..."
+                    journalctl -u "$unit" -n "$LINES" --no-pager > "$OUTDIR/${unit}.log" || true
+                  done
+            else
+              echo "No worker services found; writing placeholder."
+              echo "No worker units present" > "$OUTDIR/NO_WORKERS.txt"
+            fi
 
             ls -la "$OUTDIR"
 
@@ -68,7 +69,7 @@ jobs:
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          port: 22
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "worker-logs/*"
           target: "./"
