@@ -41,24 +41,30 @@ jobs:
           done
           [ "$miss" -eq 0 ] || exit 1
 
-      - name: Deploy over SSH (NVM-safe, preflight sudo, temp-clone + rsync, inline diagnostics)
+      - name: Deploy over SSH (NVM-safe, preflight sudo, temp-clone + rsync, write systemd override)
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Optional (needed if NOPASSWD isn't configured)
+          # Optional if NOPASSWD isn't configured
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-          # Server paths (match your manual process)
+
+          # Server locations (your current layout)
           BACKEND_DIR: /home/deploy/ExplorerToken/backend
           FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
           REPO_URL: https://github.com/WickedBroX/Blockchain.git
-          # Frontend publish directory (domain-agnostic). Blank → /var/www/html
+
+          # FE publish directory (domain-agnostic). Blank → /var/www/html
           PUBLISH_DIR: ${{ inputs.publish_dir }}
+
+          # Backend start specifics you confirmed
+          NODE_BIN: /home/deploy/.nvm/versions/node/v22.21.0/bin/node
+          ENTRYPOINT: dist/src/index.js
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           port: 22
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 45m
-          envs: SUDO_PASSWORD,BACKEND_DIR,FRONTEND_DIR,REPO_URL,PUBLISH_DIR
+          envs: SUDO_PASSWORD,BACKEND_DIR,FRONTEND_DIR,REPO_URL,PUBLISH_DIR,NODE_BIN,ENTRYPOINT
           script: |
             set -euo pipefail
             BRANCH="${{ inputs.branch }}"
@@ -68,28 +74,15 @@ jobs:
             diag_dump() {
               echo "===== DEPLOY DIAGNOSTICS ====="
               date
-              echo "User: $(whoami)"
-              echo "Host: $(hostname)"
-              echo "PWD: $(pwd)"
+              echo "User: $(whoami)"; echo "Host: $(hostname)"; echo "PWD: $(pwd)"
               echo "PATH: $PATH"
               echo "Node: $(command -v node || echo 'node not found')"
-              node -v || true
-              npm -v || true
-              echo
-              echo "== Backend build output =="
-              ls -la "$BACKEND_DIR/dist" || true
-              echo
-              echo "== Service unit file =="
-              systemctl cat explorertoken-backend 2>&1 || true
-              echo
-              echo "== Service status =="
-              systemctl status explorertoken-backend 2>&1 || true
-              echo
-              echo "== Journal -xeu (recent) =="
-              journalctl -xeu explorertoken-backend 2>&1 | tail -n 400 || true
-              echo
-              echo "== Journal -u (last 400 lines) =="
-              journalctl -u explorertoken-backend -n 400 --no-pager 2>&1 || true
+              node -v || true; npm -v || true
+              echo; echo "== Backend dist =="; ls -la "$BACKEND_DIR/dist" || true
+              echo; echo "== Unit file ==";  systemctl cat explorertoken-backend 2>&1 || true
+              echo; echo "== Status ==";     systemctl status explorertoken-backend 2>&1 || true
+              echo; echo "== Journal -xeu (tail 400) =="; journalctl -xeu explorertoken-backend 2>&1 | tail -n 400 || true
+              echo; echo "== Journal -u (last 400) ==";  journalctl -u explorertoken-backend -n 400 --no-pager 2>&1 || true
               echo "===== END DIAGNOSTICS ====="
             }
 
@@ -102,8 +95,7 @@ jobs:
               if ! sudo -n true >/dev/null 2>&1; then
                 echo "ERROR: sudo requires a password but SUDO_PASSWORD is not set."
                 echo "Fix: add SUDO_PASSWORD in Environment 'production' or grant NOPASSWD for deploy."
-                diag_dump
-                exit 1
+                diag_dump; exit 1
               fi
               SUDO='sudo -n'
               run_sudo() { $SUDO "$@"; }
@@ -136,23 +128,37 @@ jobs:
             npm ci
             npm run build
 
+            # ---------- write/refresh systemd override ----------
+            OV_DIR="/etc/systemd/system/explorertoken-backend.service.d"
+            run_sudo mkdir -p "$OV_DIR"
+            run_sudo tee "$OV_DIR/override.conf" >/dev/null <<EOF
+[Service]
+User=deploy
+WorkingDirectory=$BACKEND_DIR
+Environment=NODE_ENV=production
+Environment=PATH=$(dirname "$NODE_BIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=
+ExecStart=$NODE_BIN $ENTRYPOINT
+Restart=always
+RestartSec=3
+EOF
+
             log "daemon-reload"
             run_sudo /usr/bin/systemctl daemon-reload
 
             log "Restart backend"
             if ! run_sudo /usr/bin/systemctl restart explorertoken-backend; then
               echo "ERROR: systemctl restart failed"
-              diag_dump
-              exit 1
+              diag_dump; exit 1
             fi
 
             log "Health check"
             if ! curl -fsS http://127.0.0.1:4000/health >/dev/null; then
               echo "ERROR: /health did not return 200"
-              diag_dump
-              exit 1
+              diag_dump; exit 1
             fi
 
+            # ---------- frontend sync & build ----------
             log "Sync frontend sources → $FRONTEND_DIR"
             rsync -a --delete --exclude ".git" "$TMPDIR/repo/frontend/" "$FRONTEND_DIR/"
 
