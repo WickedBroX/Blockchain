@@ -1,151 +1,155 @@
-- name: Assert environment bindings (presence only)
-  shell: bash
-  env:
-    SSH_HOST: ${{ secrets.SSH_HOST }}
-    SSH_USER: ${{ secrets.SSH_USER }}
-    SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-    SSH_PORT: ${{ secrets.SSH_PORT }}
-    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-    WEB_ROOT: ${{ vars.WEB_ROOT }}
-  run: |
-    set -euo pipefail
+name: Deploy to VPS
 
-    env_label="${{ inputs.env }}"
-    missing=0
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "GitHub Environment"
+        required: true
+        default: production
+      branch:
+        description: "Branch to deploy"
+        required: true
+        default: main
 
-    required=(SSH_HOST SSH_USER SSH_PRIVATE_KEY)
-    optional=(SSH_PORT SUDO_PASSWORD WEB_ROOT)
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    steps:
+      - name: Assert environment bindings (presence only)
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}  # optional
+          WEB_ROOT: ${{ vars.WEB_ROOT }}               # optional
+        run: |
+          check() { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=$k::SET" || { echo "::error title=$k::MISSING"; MISSING=1; }; }
+          MISSING=0
+          echo "Asserting Environment: ${{ inputs.env }}"
+          check SSH_HOST; check SSH_USER; check SSH_PRIVATE_KEY
+          echo "Optional:"; check SSH_PORT; check SUDO_PASSWORD; check WEB_ROOT
+          [ "$MISSING" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
 
-    for var in "${required[@]}"; do
-      value="${!var:-}"
-      if [ -z "$value" ]; then
-        echo "::error title=${env_label} environment::${var} is required but not set"
-        missing=1
-      else
-        echo "::notice title=${env_label} environment::${var} is present"
-      fi
-    done
+      - name: Deploy over SSH (build on VPS, NVM-safe)
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Optional: supply only if you didn't configure NOPASSWD sudoers
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          # Optional: environment var for web root
+          WEB_ROOT: ${{ vars.WEB_ROOT }}
 
-    for var in "${optional[@]}"; do
-      value="${!var:-}"
-      if [ -n "$value" ]; then
-        echo "::notice title=${env_label} environment::${var} is present (optional)"
-      else
-        echo "::notice title=${env_label} environment::${var} not provided (optional)"
-      fi
-    done
+          # IMPORTANT: forward these to remote shell
+          BACKEND_DIR: /home/deploy/ExplorerToken/backend
+          FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
+          REPO_URL: https://github.com/WickedBroX/Blockchain.git
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,REPO_URL
+          script: |
+            set -euo pipefail
 
-    if [ "$missing" -eq 1 ]; then
-      exit 1
-    fi
-- name: Deploy over SSH (build on VPS, NVM-safe)
-  uses: appleboy/ssh-action@v1.0.3
-  env:
-    # Optional: only if you didn't configure NOPASSWD sudoers
-    SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-    # Optional: set this in the Environment
-    WEB_ROOT: ${{ vars.WEB_ROOT }}
-    GITHUB_REPOSITORY: ${{ github.repository }}
+            BRANCH="${{ inputs.branch }}"
 
-    # IMPORTANT: forward these to the remote shell
-    BACKEND_DIR: /home/deploy/ExplorerToken/backend
-    FRONTEND_DIR: /home/deploy/ExplorerToken/frontend
-  with:
-    host: ${{ secrets.SSH_HOST }}
-    username: ${{ secrets.SSH_USER }}
-    port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
-    key: ${{ secrets.SSH_PRIVATE_KEY }}
-    command_timeout: 30m
-    # Forward step envs to remote session:
-    envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,GITHUB_REPOSITORY
-    script: |
-      set -euo pipefail
+            # Choose sudo strategy
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              SUDO='echo "$SUDO_PASSWORD" | sudo -S'
+            else
+              SUDO='sudo'
+            fi
 
-      BRANCH="${{ inputs.branch }}"
+            # Ensure dirs
+            mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-      if [ -z "${GITHUB_REPOSITORY:-}" ]; then
-        echo "::error::GITHUB_REPOSITORY is not set"
-        exit 1
-      fi
+            # --- NVM bootstrap (non-interactive shell) ---
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+            node -v
+            npm -v
 
-      REPO_URL="git@github.com:${GITHUB_REPOSITORY}.git"
+            # --- Backend ---
+            cd "$BACKEND_DIR"
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin "$REPO_URL"
+            fi
+            CUR=$(git remote get-url origin || true)
+            if [ "$CUR" != "$REPO_URL" ]; then
+              git remote set-url origin "$REPO_URL"
+            fi
+            git fetch --prune origin
+            git checkout -B "$BRANCH" "origin/$BRANCH"
 
-      # Choose sudo strategy
-      if [ -n "${SUDO_PASSWORD:-}" ]; then
-        SUDO='echo "$SUDO_PASSWORD" | sudo -S'
-      else
-        SUDO='sudo'
-      fi
+            echo "Installing backend deps..."
+            npm ci
+            echo "Building backend..."
+            npm run build
 
-      # Ensure dirs
-      mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
+            echo "Restarting backend service..."
+            $SUDO /usr/bin/systemctl restart explorertoken-backend
+            sleep 2
+            echo "Backend health:"
+            curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
 
-      # --- NVM bootstrap (non-interactive shell) ---
-      export NVM_DIR="$HOME/.nvm"
-      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-      export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
-      node -v
-      npm -v
+            # --- Frontend ---
+            cd "$FRONTEND_DIR"
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin "$REPO_URL"
+            fi
+            CUR=$(git remote get-url origin || true)
+            if [ "$CUR" != "$REPO_URL" ]; then
+              git remote set-url origin "$REPO_URL"
+            fi
+            git fetch --prune origin
+            git checkout -B "$BRANCH" "origin/$BRANCH"
 
-      # --- Backend ---
-      cd "$BACKEND_DIR"
-      if [ ! -d .git ]; then
-        git init
-        git remote add origin "$REPO_URL"
-      fi
-      CUR=$(git remote get-url origin || true)
-      if [ "$CUR" != "$REPO_URL" ]; then
-        git remote set-url origin "$REPO_URL"
-      fi
-      git fetch --prune origin
-      git checkout -B "$BRANCH" "origin/$BRANCH"
+            echo "Installing frontend deps..."
+            npm ci
+            echo "Building frontend..."
+            npm run build
 
-      echo "Installing backend deps..."
-      npm ci
-      echo "Building backend..."
-      npm run build
+            # Detect web root or fallback
+            if [ -z "${WEB_ROOT:-}" ]; then
+              CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
+              if [ -n "$CAND" ]; then
+                WEB_ROOT=$(awk '/\\sroot\\s/{print $2}' "$CAND" | tr -d ';' | tail -n1)
+              fi
+              WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
+            fi
+            echo "WEB_ROOT => $WEB_ROOT"
 
-      echo "Restarting backend service..."
-      $SUDO /usr/bin/systemctl restart explorertoken-backend
-      sleep 2
-      echo "Backend health:"
-      curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
+            echo "Syncing frontend dist → WEB_ROOT"
+            $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
 
-      # --- Frontend ---
-      cd "$FRONTEND_DIR"
-      if [ ! -d .git ]; then
-        git init
-        git remote add origin "$REPO_URL"
-      fi
-      CUR=$(git remote get-url origin || true)
-      if [ "$CUR" != "$REPO_URL" ]; then
-        git remote set-url origin "$REPO_URL"
-      fi
-      git fetch --prune origin
-      git checkout -B "$BRANCH" "origin/$BRANCH"
+            echo "Testing Nginx config..."
+            $SUDO /usr/sbin/nginx -t
+            echo "Reloading Nginx..."
+            $SUDO /usr/bin/systemctl reload nginx
 
-      echo "Installing frontend deps..."
-      npm ci
-      echo "Building frontend..."
-      npm run build
+            # Save backend logs for artifact
+            journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
 
-      # Detect web root or fallback
-      if [ -z "${WEB_ROOT:-}" ]; then
-        CAND=$(grep -Rsl "server_name\\s\\+haswork\\.dev" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | head -n1 || true)
-        if [ -n "$CAND" ]; then
-          WEB_ROOT=$(awk '/\\sroot\\s/{print $2}' "$CAND" | tr -d ';' | tail -n1)
-        fi
-        WEB_ROOT=${WEB_ROOT:-/var/www/haswork.dev}
-      fi
-      echo "WEB_ROOT => $WEB_ROOT"
+      - name: Pull back server logs (artifact)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "server-logs.txt"
+          target: "./"
 
-      echo "Syncing frontend dist → WEB_ROOT"
-      $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
-
-      echo "Testing Nginx config..."
-      $SUDO /usr/sbin/nginx -t
-      echo "Reloading Nginx..."
-      $SUDO /usr/bin/systemctl reload nginx
-
-      # Save backend logs for artifact
-      journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
+      - name: Upload backend logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs
+          path: server-logs.txt
