@@ -42,7 +42,7 @@ jobs:
 
           [ "$missing_required" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
 
-      - name: Deploy over SSH (NVM-safe, temp-clone + rsync)
+      - name: Deploy over SSH (NVM-safe, preflight sudo, temp-clone + rsync)
         uses: appleboy/ssh-action@v1.0.3
         env:
           # Optional (only if you didn't configure NOPASSWD sudoers)
@@ -58,27 +58,43 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           port: 22
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 30m
+          command_timeout: 45m
           envs: SUDO_PASSWORD,WEB_ROOT,BACKEND_DIR,FRONTEND_DIR,REPO_URL
           script: |
             set -euo pipefail
 
             BRANCH="${{ inputs.branch }}"
 
-            # sudo strategy
+            # --- Preflight: sudo mode ---
             if [ -n "${SUDO_PASSWORD:-}" ]; then
-              SUDO='echo "$SUDO_PASSWORD" | sudo -S'
+              SUDO='sudo -S -p ""'
+              # quick probe with password
+              echo "$SUDO_PASSWORD" | $SUDO -k true >/dev/null 2>&1 || { echo "ERROR: Provided SUDO_PASSWORD is incorrect or sudo not permitted."; exit 1; }
             else
-              SUDO='sudo'
+              # require NOPASSWD
+              if ! sudo -n true >/dev/null 2>&1; then
+                echo "ERROR: sudo requires a password but no SUDO_PASSWORD secret was provided."
+                echo "Fix: add SUDO_PASSWORD to Environment 'production' secrets OR configure NOPASSWD in sudoers for deploy user."
+                exit 1
+              fi
+              SUDO='sudo -n'
             fi
 
-            # Ensure dirs
+            # --- Ensure dirs ---
             mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
 
-            # --- NVM bootstrap ---
+            # --- NVM bootstrap (install if missing) ---
             export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-            export PATH="$HOME/.nvm/versions/node/v22.21.0/bin:$PATH"
+            if [ -s "$NVM_DIR/nvm.sh" ]; then
+              . "$NVM_DIR/nvm.sh"
+            fi
+            if ! command -v node >/dev/null 2>&1; then
+              echo "Node not found; installing Node 22 via NVM..."
+              [ -s "$NVM_DIR/nvm.sh" ] || { echo "ERROR: NVM not found at $NVM_DIR"; exit 1; }
+              nvm install 22
+            fi
+            nvm use 22 >/dev/null 2>&1 || true
+            export PATH="$HOME/.nvm/versions/node/$(node -v | tr -d v)/bin:$PATH"
             node -v
             npm -v
 
@@ -95,7 +111,11 @@ jobs:
             npm run build
 
             # Restart backend and verify
-            $SUDO /usr/bin/systemctl restart explorertoken-backend
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              echo "$SUDO_PASSWORD" | $SUDO /usr/bin/systemctl restart explorertoken-backend
+            else
+              $SUDO /usr/bin/systemctl restart explorertoken-backend
+            fi
             sleep 2
             curl -fsS http://127.0.0.1:4000/health || (journalctl -u explorertoken-backend -n 200 --no-pager; exit 1)
 
@@ -118,11 +138,15 @@ jobs:
             echo "WEB_ROOT => $WEB_ROOT"
 
             # Publish frontend dist
-            $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
-
-            # Nginx sanity
-            $SUDO /usr/sbin/nginx -t
-            $SUDO /usr/bin/systemctl reload nginx
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              echo "$SUDO_PASSWORD" | $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
+              echo "$SUDO_PASSWORD" | $SUDO /usr/sbin/nginx -t
+              echo "$SUDO_PASSWORD" | $SUDO /usr/bin/systemctl reload nginx
+            else
+              $SUDO /usr/bin/rsync -a --delete dist/ "$WEB_ROOT"/
+              $SUDO /usr/sbin/nginx -t
+              $SUDO /usr/bin/systemctl reload nginx
+            fi
 
             # Save logs for artifact
             journalctl -u explorertoken-backend -n 400 --no-pager > "$HOME/server-logs.txt" || true
