@@ -17,24 +17,25 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.env }}
     steps:
-      - name: Assert environment bindings (presence only)
+      - name: Assert required secrets (presence only)
         shell: bash
         env:
-          # REQUIRED
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           set +u
-          missing_required=0
-          check_required () { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=REQUIRED:$k::SET" || { echo "::error title=REQUIRED:$k::MISSING"; missing_required=1; }; }
-
-          echo "Asserting Environment: ${{ inputs.env }}"
-          check_required SSH_HOST
-          check_required SSH_USER
-          check_required SSH_PRIVATE_KEY
-
-          [ "$missing_required" -eq 0 ] || { echo "Missing required secrets"; exit 1; }
+          miss=0
+          for k in SSH_HOST SSH_USER SSH_PRIVATE_KEY; do
+            v="${!k-}"
+            if [ -z "$v" ]; then
+              echo "::error title=REQUIRED:$k::MISSING"
+              miss=1
+            else
+              echo "::notice title=REQUIRED:$k::SET"
+            fi
+          done
+          [ "$miss" -eq 0 ] || exit 1
 
       - name: SSH: dump worker logs to files
         uses: appleboy/ssh-action@v1.0.3
