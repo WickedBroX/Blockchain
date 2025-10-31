@@ -1,53 +1,30 @@
-name: SSH Smoke
+name: Diagnose Environment Secrets
 
 on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Environment with SSH_* secrets"
-        default: production
+        description: "GitHub Environment"
         required: true
-        type: string
+        default: production
 
 jobs:
-  smoke:
+  diag:
     runs-on: ubuntu-latest
     environment: ${{ inputs.env }}
     steps:
-      - name: Assert secrets exist
-        run: |
-          test -n "${{ secrets.SSH_PRIVATE_KEY }}" || (echo "MISSING: SSH_PRIVATE_KEY" && exit 1)
-          test -n "${{ secrets.SSH_HOST }}"        || (echo "MISSING: SSH_HOST" && exit 1)
-          test -n "${{ secrets.SSH_USER }}"        || (echo "MISSING: SSH_USER" && exit 1)
-          test -n "${{ secrets.SSH_PORT }}"        || (echo "MISSING: SSH_PORT" && exit 1)
-
-      # Normalize CRLF → LF and write to a file
-      - name: Prepare private key file
-        run: |
-          umask 077
-          printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > id_gha
-          head -1 id_gha | grep -q 'BEGIN OPENSSH PRIVATE KEY' || { echo "Not an OpenSSH private key"; exit 1; }
-          tail -1 id_gha | grep -q 'END OPENSSH PRIVATE KEY'   || { echo "Key footer missing"; exit 1; }
-          wc -c id_gha
-
-      - name: Start ssh-agent & add key (verbose)
-        run: |
-          eval "$(ssh-agent -s)"
-          ssh-add -vvv ./id_gha
-
-      - name: Known hosts
+      - name: Check required secrets/vars (presence only)
+        shell: bash
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -p "${SSH_PORT:-22}" "$SSH_HOST" >> ~/.ssh/known_hosts
-
-      - name: SSH debug
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}             # optional
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}   # optional
+          WEB_ROOT: ${{ vars.WEB_ROOT }}               # optional (ENV var)
         run: |
-          ssh -vvv -o StrictHostKeyChecking=yes -p "${SSH_PORT:-22}" \
-              "$SSH_USER@$SSH_HOST" 'whoami; uname -a; ls -la ~/ExplorerToken || true'
+          check() { local k="$1"; local v="${!k-}"; [ -n "$v" ] && echo "::notice title=$k::SET" || echo "::error title=$k::MISSING"; }
+          echo "Diagnosing Environment: ${{ inputs.env }}"
+          echo "Required:"; check SSH_HOST; check SSH_USER; check SSH_PRIVATE_KEY
+          echo "Optional:"; check SSH_PORT; check SUDO_PASSWORD; check WEB_ROOT
+          echo "Open this step’s logs for which items are SET/MISSING."
